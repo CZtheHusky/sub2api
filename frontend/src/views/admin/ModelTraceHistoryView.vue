@@ -1,102 +1,115 @@
 <template>
-  <div class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-    <div class="mb-6 flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <h1 class="text-2xl font-bold text-gray-900 dark:text-gray-100">{{ t('admin.accounts.modeltraceHistory.title') }}</h1>
-        <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">{{ t('admin.accounts.modeltraceHistory.description') }}</p>
-      </div>
-      <div class="flex items-center gap-2">
-        <button @click="loadFingerprint" class="rounded-lg border border-gray-300 px-3 py-2 text-sm hover:bg-gray-50 dark:border-dark-600 dark:text-gray-200 dark:hover:bg-dark-700">
-          {{ t('admin.accounts.modeltraceHistory.bank') }}: {{ fingerprintCommit ? fingerprintCommit.slice(0, 10) : '…' }}
-        </button>
-        <button @click="refreshBank" :disabled="refreshingBank" class="rounded-lg bg-primary-600 px-3 py-2 text-sm text-white hover:bg-primary-700 disabled:opacity-50">
-          {{ refreshingBank ? t('admin.accounts.modeltraceHistory.refreshing') : t('admin.accounts.modeltraceHistory.refreshBank') }}
-        </button>
-      </div>
-    </div>
-
-    <div class="mb-4 flex flex-wrap items-center gap-3">
-      <select v-model="accountId" class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm dark:border-dark-600 dark:bg-dark-800 dark:text-gray-100">
-        <option :value="0" disabled>{{ t('admin.accounts.modeltraceHistory.chooseAccount') }}</option>
-        <option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.name }} (#{{ a.id }})</option>
-      </select>
-      <input v-model="modelFilter" :placeholder="t('admin.accounts.modeltraceHistory.modelFilter')" class="w-48 rounded-lg border border-gray-300 px-3 py-2 text-sm dark:border-dark-600 dark:bg-dark-800 dark:text-gray-100" @keyup.enter="reload" />
-      <select v-model="outcomeFilter" class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm dark:border-dark-600 dark:bg-dark-800 dark:text-gray-100">
-        <option value="all">{{ t('admin.accounts.modeltraceHistory.filterAll') }}</option>
-        <option value="success">{{ t('admin.accounts.modeltraceHistory.filterSuccess') }}</option>
-      </select>
-      <button @click="reload" class="rounded-lg bg-primary-600 px-4 py-2 text-sm text-white hover:bg-primary-700">{{ t('admin.accounts.modeltraceHistory.query') }}</button>
-    </div>
-
-    <div v-if="!accountId" class="rounded-xl border border-dashed border-gray-300 p-10 text-center text-sm text-gray-400 dark:border-dark-600">
-      {{ t('admin.accounts.modeltraceHistory.selectFirst') }}
-    </div>
-
-    <div v-else-if="loading" class="rounded-xl border border-gray-200 p-10 text-center text-sm text-gray-400 dark:border-dark-700">
-      {{ t('admin.accounts.modeltraceHistory.loading') }}
-    </div>
-
-    <div v-else-if="!items.length" class="rounded-xl border border-dashed border-gray-300 p-10 text-center text-sm text-gray-400 dark:border-dark-600">
-      {{ t('admin.accounts.modeltraceHistory.empty') }}
-    </div>
-
-    <div v-else class="overflow-x-auto rounded-xl border border-gray-200 dark:border-dark-700">
-      <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-dark-700">
-        <thead class="bg-gray-50 text-left text-xs uppercase text-gray-500 dark:bg-dark-800 dark:text-gray-400">
-          <tr>
-            <th class="px-4 py-3">{{ t('admin.accounts.modeltraceHistory.colTime') }}</th>
-            <th class="px-4 py-3">{{ t('admin.accounts.modeltraceHistory.colModel') }}</th>
-            <th class="px-4 py-3">{{ t('admin.accounts.modeltraceHistory.colVerdict') }}</th>
-            <th class="px-4 py-3">{{ t('admin.accounts.modeltraceHistory.colPredicted') }}</th>
-            <th class="px-4 py-3">{{ t('admin.accounts.modeltraceHistory.colProbability') }}</th>
-            <th class="px-4 py-3">{{ t('admin.accounts.modeltraceHistory.colDuration') }}</th>
-            <th class="px-4 py-3">{{ t('admin.accounts.modeltraceHistory.colProxy') }}</th>
-            <th class="px-4 py-3">{{ t('admin.accounts.modeltraceHistory.colBank') }}</th>
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-gray-100 dark:divide-dark-700">
-          <tr v-for="row in items" :key="row.id" class="cursor-pointer hover:bg-gray-50 dark:hover:bg-dark-800" @click="selected = row">
-            <td class="whitespace-nowrap px-4 py-3 text-gray-500 dark:text-gray-400">{{ formatTime(row.occurred_at) }}</td>
-            <td class="px-4 py-3 font-medium text-gray-900 dark:text-gray-100">{{ row.model }}</td>
-            <td class="px-4 py-3">
-              <span :class="verdictClass(row)">{{ verdictLabel(row) }}</span>
-            </td>
-            <td class="px-4 py-3">{{ row.fingerprint_predicted_model || '—' }}</td>
-            <td class="px-4 py-3">{{ row.fingerprint_probability != null ? (row.fingerprint_probability * 100).toFixed(1) + '%' : '—' }}</td>
-            <td class="whitespace-nowrap px-4 py-3">{{ row.duration_ms ? (row.duration_ms / 1000).toFixed(1) + 's' : '—' }}</td>
-            <td class="px-4 py-3">{{ row.proxy_name || '—' }}</td>
-            <td class="px-4 py-3 font-mono text-xs text-gray-400">{{ row.fingerprint_commit ? row.fingerprint_commit.slice(0, 8) : '—' }}</td>
-          </tr>
-        </tbody>
-      </table>
-      <div class="flex items-center justify-between border-t border-gray-200 px-4 py-3 text-sm dark:border-dark-700">
-        <span class="text-gray-500">{{ t('admin.accounts.modeltraceHistory.total', { total }) }}</span>
-        <div class="flex items-center gap-2">
-          <button :disabled="page <= 1" class="rounded border px-2 py-1 disabled:opacity-40 dark:border-dark-600" @click="page--; load()">{{ t('admin.accounts.modeltraceHistory.prev') }}</button>
-          <span>{{ page }} / {{ totalPages }}</span>
-          <button :disabled="page >= totalPages" class="rounded border px-2 py-1 disabled:opacity-40 dark:border-dark-600" @click="page++; load()">{{ t('admin.accounts.modeltraceHistory.next') }}</button>
+  <AppLayout>
+    <TablePageLayout>
+      <template #actions>
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+            <Icon name="sparkles" size="sm" class="text-violet-500" />
+            {{ t('admin.accounts.modeltraceHistory.description') }}
+          </div>
+          <div class="flex items-center gap-2">
+            <button class="btn-secondary" @click="loadFingerprint">
+              {{ t('admin.accounts.modeltraceHistory.bank') }}: {{ fingerprintCommit ? fingerprintCommit.slice(0, 10) : '…' }}
+            </button>
+            <button class="btn-primary" :disabled="refreshingBank" @click="refreshBank">
+              {{ refreshingBank ? t('admin.accounts.modeltraceHistory.refreshing') : t('admin.accounts.modeltraceHistory.refreshBank') }}
+            </button>
+          </div>
         </div>
-      </div>
-    </div>
+      </template>
+
+      <template #filters>
+        <div class="flex flex-wrap items-center gap-3">
+          <div class="w-full sm:w-64">
+            <select v-model="accountId" class="input" @change="reload">
+              <option :value="0" disabled>{{ t('admin.accounts.modeltraceHistory.chooseAccount') }}</option>
+              <option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.name }} (#{{ a.id }})</option>
+            </select>
+          </div>
+          <div class="relative w-full sm:w-56">
+            <Icon name="search" size="md" class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500" />
+            <input v-model="modelFilter" type="text" :placeholder="t('admin.accounts.modeltraceHistory.modelFilter')" class="input pl-10" @keyup.enter="reload" />
+          </div>
+          <div class="w-full sm:w-36">
+            <select v-model="outcomeFilter" class="input" @change="reload">
+              <option value="all">{{ t('admin.accounts.modeltraceHistory.filterAll') }}</option>
+              <option value="success">{{ t('admin.accounts.modeltraceHistory.filterSuccess') }}</option>
+            </select>
+          </div>
+          <button class="btn-primary" @click="reload">{{ t('admin.accounts.modeltraceHistory.query') }}</button>
+        </div>
+      </template>
+
+      <template #table>
+        <div v-if="!accountId" class="table-wrapper p-10 text-center text-sm text-gray-400">
+          {{ t('admin.accounts.modeltraceHistory.selectFirst') }}
+        </div>
+        <div v-else-if="loading" class="table-wrapper p-10 text-center text-sm text-gray-400">
+          {{ t('admin.accounts.modeltraceHistory.loading') }}
+        </div>
+        <div v-else-if="!items.length" class="table-wrapper p-10 text-center text-sm text-gray-400">
+          {{ t('admin.accounts.modeltraceHistory.empty') }}
+        </div>
+        <div v-else class="table-wrapper">
+          <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-dark-700">
+            <thead>
+              <tr>
+                <th>{{ t('admin.accounts.modeltraceHistory.colTime') }}</th>
+                <th>{{ t('admin.accounts.modeltraceHistory.colModel') }}</th>
+                <th>{{ t('admin.accounts.modeltraceHistory.colVerdict') }}</th>
+                <th>{{ t('admin.accounts.modeltraceHistory.colPredicted') }}</th>
+                <th>{{ t('admin.accounts.modeltraceHistory.colProbability') }}</th>
+                <th>{{ t('admin.accounts.modeltraceHistory.colDuration') }}</th>
+                <th>{{ t('admin.accounts.modeltraceHistory.colProxy') }}</th>
+                <th>{{ t('admin.accounts.modeltraceHistory.colBank') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in items" :key="row.id" class="cursor-pointer hover:bg-gray-50 dark:hover:bg-dark-700/50" @click="selected = row">
+                <td class="whitespace-nowrap text-gray-500 dark:text-gray-400">{{ formatTime(row.occurred_at) }}</td>
+                <td class="font-medium text-gray-900 dark:text-gray-100">{{ row.model }}</td>
+                <td><span :class="verdictClass(row)">{{ verdictLabel(row) }}</span></td>
+                <td>{{ row.fingerprint_predicted_model || '—' }}</td>
+                <td>{{ row.fingerprint_probability != null ? (row.fingerprint_probability * 100).toFixed(1) + '%' : '—' }}</td>
+                <td class="whitespace-nowrap">{{ row.duration_ms ? (row.duration_ms / 1000).toFixed(1) + 's' : '—' }}</td>
+                <td>{{ row.proxy_name || '—' }}</td>
+                <td class="font-mono text-xs text-gray-400">{{ row.fingerprint_commit ? row.fingerprint_commit.slice(0, 8) : '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+
+      <template #pagination>
+        <div v-if="accountId && total > 0" class="flex items-center justify-between text-sm">
+          <span class="text-gray-500 dark:text-gray-400">{{ t('admin.accounts.modeltraceHistory.total', { total }) }}</span>
+          <div class="flex items-center gap-2">
+            <button class="btn-secondary" :disabled="page <= 1" @click="page--; load()">{{ t('admin.accounts.modeltraceHistory.prev') }}</button>
+            <span class="text-gray-500 dark:text-gray-400">{{ page }} / {{ totalPages }}</span>
+            <button class="btn-secondary" :disabled="page >= totalPages" @click="page++; load()">{{ t('admin.accounts.modeltraceHistory.next') }}</button>
+          </div>
+        </div>
+      </template>
+    </TablePageLayout>
 
     <!-- 详情抽屉 -->
     <div v-if="selected" class="fixed inset-0 z-50 flex justify-end bg-black/40" @click.self="selected = null">
       <div class="h-full w-full max-w-lg overflow-y-auto bg-white p-6 shadow-xl dark:bg-dark-900">
         <div class="mb-4 flex items-center justify-between">
           <h2 class="text-lg font-bold text-gray-900 dark:text-gray-100">{{ t('admin.accounts.modeltraceHistory.detailTitle') }}</h2>
-          <button class="text-gray-400 hover:text-gray-600" @click="selected = null">✕</button>
+          <button class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200" @click="selected = null">✕</button>
         </div>
         <dl class="space-y-3 text-sm">
           <template v-for="(value, key) in detailRows" :key="key">
             <div class="flex justify-between gap-4 border-b border-gray-100 pb-2 dark:border-dark-800">
-              <dt class="text-gray-500">{{ key }}</dt>
+              <dt class="text-gray-500 dark:text-gray-400">{{ key }}</dt>
               <dd class="text-right font-medium text-gray-900 dark:text-gray-200">{{ value }}</dd>
             </div>
           </template>
         </dl>
       </div>
     </div>
-  </div>
+  </AppLayout>
 </template>
 
 <script setup lang="ts">
@@ -105,6 +118,9 @@ import { useI18n } from 'vue-i18n'
 import { apiClient } from '@/api/client'
 import * as tickets from '@/api/admin/codexTickets'
 import type { TicketAttempt } from '@/api/admin/codexTickets'
+import AppLayout from '@/components/layout/AppLayout.vue'
+import TablePageLayout from '@/components/layout/TablePageLayout.vue'
+import Icon from '@/components/icons/Icon.vue'
 
 const { t, locale } = useI18n()
 
