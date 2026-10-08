@@ -334,6 +334,26 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	stepUpAuthMiddleware := middleware.NewStepUpAuthMiddleware(totpService, userService, settingService)
 	engine := server.ProvideRouter(configConfig, handlers, jwtAuthMiddleware, optionalJWTAuthMiddleware, adminAuthMiddleware, apiKeyAuthMiddleware, auditLogMiddleware, stepUpAuthMiddleware, apiKeyService, subscriptionService, opsService, settingService, compositeRouteResolver, redisClient)
 	httpServer := server.ProvideHTTPServer(configConfig, engine)
+	// ModelTrace 降智诊断接线：网关路由 + 管理员 API key 服务 + 网关服务 + 设置服务 + 探测记录仓库
+	codexTicketAttempts := repository.NewCodexTicketAttemptRepository(db)
+	handlers.Admin.Account.SetCodexTicketDiagnosticRouter(engine, apiKeyService, openAIGatewayService, settingService, codexTicketAttempts)
+	go func() {
+		// 分区滚动维护：启动时一次，之后每日一次（预建未来日分区/清理过期分区）
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		if err := codexTicketAttempts.Cleanup(cleanupCtx); err != nil {
+			log.Printf("[codex-ticket] partition cleanup failed: %v", err)
+		}
+		cancel()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			if err := codexTicketAttempts.Cleanup(cleanupCtx); err != nil {
+				log.Printf("[codex-ticket] partition cleanup failed: %v", err)
+			}
+			cancel()
+		}
+	}()
 	opsMetricsCollector := service.ProvideOpsMetricsCollector(opsRepository, settingRepository, accountRepository, concurrencyService, db, redisClient, configConfig)
 	opsAggregationService := service.ProvideOpsAggregationService(opsRepository, settingRepository, db, redisClient, configConfig)
 	opsAlertEvaluatorService := service.ProvideOpsAlertEvaluatorService(opsService, opsRepository, emailService, redisClient, configConfig, proxyRepository)

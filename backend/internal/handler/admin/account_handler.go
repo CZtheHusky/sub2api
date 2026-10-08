@@ -56,6 +56,11 @@ type AccountHandler struct {
 	geminiOAuthService      *service.GeminiOAuthService
 	antigravityOAuthService *service.AntigravityOAuthService
 	grokOAuthService        service.GrokOAuthTokenService
+	codexTicketGateway      *service.OpenAIGatewayService
+	codexTicketRouter       http.Handler
+	codexTicketAPIKeys      *service.APIKeyService
+	codexTicketSettings     *service.SettingService
+	codexTicketAttempts     service.CodexTicketAttemptRepository
 	rateLimitService        *service.RateLimitService
 	accountUsageService     *service.AccountUsageService
 	accountTestService      *service.AccountTestService

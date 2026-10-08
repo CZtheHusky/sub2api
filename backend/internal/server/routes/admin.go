@@ -367,6 +367,11 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.GET("/opencode-go-usage/settings", h.Admin.Account.GetOpenCodeGoUsageSettings)
 		accounts.PUT("/opencode-go-usage/settings", h.Admin.Account.UpdateOpenCodeGoUsageSettings)
 		accounts.GET("/:id", h.Admin.Account.GetByID)
+		// ModelTrace 降智诊断（指纹库版本/刷新、诊断执行、历史记录）
+		accounts.GET("/codex-ticket-fingerprint", h.Admin.Account.GetCodexFingerprintVersion)
+		accounts.POST("/codex-ticket-fingerprint/refresh", h.Admin.Account.RefreshCodexFingerprint)
+		accounts.GET("/:id/codex-ticket-history", h.Admin.Account.GetCodexTicketHistory)
+		accounts.POST("/:id/codex-ticket-diagnostic", h.Admin.Account.DiagnoseCodexModels)
 		accounts.GET("/:id/claude/reset-credits", h.Admin.Account.ClaudeResetCredits)
 		// Same protection as the Codex reset-quota route (admin auth, audit, compliance guard).
 		accounts.POST("/:id/claude/reset-credits/redeem", h.Admin.Account.RedeemClaudeResetCredit)

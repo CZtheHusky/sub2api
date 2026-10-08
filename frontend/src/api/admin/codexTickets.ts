@@ -1,0 +1,67 @@
+import { apiClient } from '../client'
+import type { ApiKey } from '@/types'
+
+export interface TicketAttempt {
+  id: number
+  account_id: number
+  model: string
+  occurred_at: string
+  outcome: string
+  trigger?: string
+  http_status?: number | null
+  ticket_length?: number | null
+  duration_ms?: number
+  reason_code?: string
+  proxy_id?: number
+  proxy_name?: string
+  expires_at?: string | null
+  verification_method?: string
+  fingerprint_commit?: string
+  fingerprint_predicted_model?: string
+  fingerprint_probability?: number | null
+  fingerprint_matched?: boolean | null
+  challenge_expected_count?: number | null
+  parsed_number_count?: number | null
+}
+
+export interface TicketDiagnostic {
+  model: string
+  gateway_error_code?: string
+  status: 'normal' | 'degraded' | 'uncertain' | 'failed'
+  reason?: string
+  predicted_model?: string
+  probability?: number
+  parsed_number_count?: number
+  http_status?: number
+}
+
+const base = (id: number) => `/admin/accounts/${id}`
+
+export async function fingerprint(): Promise<{ commit: string; models: string[] }> {
+  const { data } = await apiClient.get('/admin/accounts/codex-ticket-fingerprint')
+  return data
+}
+
+export async function refreshFingerprint(): Promise<{ commit: string; models: string[] }> {
+  const { data } = await apiClient.post('/admin/accounts/codex-ticket-fingerprint/refresh')
+  return data
+}
+
+export async function diagnose(id: number, apiKeyID: number, models: string[], signal?: AbortSignal): Promise<{ items: TicketDiagnostic[]; canceled: boolean }> {
+  const { data } = await apiClient.post(`${base(id)}/codex-ticket-diagnostic`, { api_key_id: apiKeyID, models }, { timeout: Math.max(120000, models.length * 180000), signal })
+  return data
+}
+
+export async function ownKeys(): Promise<ApiKey[]> {
+  const keys: ApiKey[] = []
+  for (let page = 1; ; page++) {
+    const { data } = await apiClient.get<{ items: ApiKey[]; total: number }>('/keys', { params: { page, page_size: 100, status: 'active' } })
+    keys.push(...data.items)
+    if (keys.length >= data.total || !data.items.length) return keys
+  }
+}
+
+export async function history(id: number, params: { model?: string; filter?: string; page: number; page_size: number }): Promise<{ items: TicketAttempt[]; total: number; page: number; page_size: number }> {
+  const { data } = await apiClient.get(`${base(id)}/codex-ticket-history`, { params })
+  return data
+}
