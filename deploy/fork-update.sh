@@ -10,8 +10,23 @@ set -euo pipefail
 REPO="CZtheHusky/sub2api"
 CONF="${FORK_UPDATE_CONF:-/etc/sub2api-fork-instances.conf}"
 
-tag=$(curl -sf --connect-timeout 15 --max-time 30 "https://api.github.com/repos/${REPO}/releases/latest" \
-  | grep -oE '"tag_name": *"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/' || true)
+# fork release 带 -fork. 后缀，goreleaser 会标记为 prerelease，/releases/latest 会跳过它们；
+# 因此列出最近 release，取第一个匹配 fork tag 命名规范的非草稿版本。
+tag=$(curl -sf --connect-timeout 15 --max-time 30 "https://api.github.com/repos/${REPO}/releases?per_page=20" \
+  | python3 -c "
+import json, re, sys
+try:
+    releases = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for r in releases:
+    t = r.get('tag_name') or ''
+    if r.get('draft'):
+        continue
+    if re.fullmatch(r'v\d+\.\d+\.\d+-fork\..+', t):
+        print(t)
+        break
+" || true)
 if [ -z "${tag:-}" ]; then echo "无法获取最新 release，跳过"; exit 0; fi
 ver="${tag#v}"
 echo "最新 fork release: ${tag}"
