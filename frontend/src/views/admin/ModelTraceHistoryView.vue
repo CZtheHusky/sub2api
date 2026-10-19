@@ -3,11 +3,11 @@
     <TablePageLayout>
       <template #actions>
         <div class="flex flex-wrap items-center justify-end gap-2">
-          <button class="btn-secondary inline-flex items-center gap-1.5 whitespace-nowrap" @click="loadFingerprint">
+          <button class="btn btn-secondary whitespace-nowrap" @click="loadFingerprint">
             <Icon name="sparkles" size="sm" class="text-violet-500" />
             {{ t('admin.accounts.modeltraceHistory.bank') }}: {{ fingerprintCommit ? fingerprintCommit.slice(0, 10) : '…' }}
           </button>
-          <button class="btn-primary shrink-0 whitespace-nowrap" :disabled="refreshingBank" @click="refreshBank">
+          <button class="btn btn-primary shrink-0 whitespace-nowrap" :disabled="refreshingBank" @click="refreshBank">
             {{ refreshingBank ? t('admin.accounts.modeltraceHistory.refreshing') : t('admin.accounts.modeltraceHistory.refreshBank') }}
           </button>
         </div>
@@ -32,8 +32,8 @@
               <option value="failed">{{ t('admin.accounts.modeltraceHistory.filterFailed') }}</option>
             </select>
           </div>
-          <button class="btn-primary shrink-0 whitespace-nowrap" :disabled="loading" @click="reload">{{ t('admin.accounts.modeltraceHistory.query') }}</button>
-          <button v-if="accountId" class="btn-danger ml-auto shrink-0 whitespace-nowrap" :disabled="loading" @click="showDeleteDialog = true">
+          <button class="btn btn-primary shrink-0 whitespace-nowrap" :disabled="loading" @click="reload">{{ t('admin.accounts.modeltraceHistory.query') }}</button>
+          <button v-if="accountId" class="btn btn-danger ml-auto shrink-0 whitespace-nowrap" :disabled="loading" @click="showDeleteDialog = true">
             {{ t('admin.accounts.modeltraceHistory.deleteRecords') }}
           </button>
         </div>
@@ -84,9 +84,9 @@
         <div v-if="accountId && total > 0" class="flex items-center justify-between text-sm">
           <span class="text-gray-500 dark:text-gray-400">{{ t('admin.accounts.modeltraceHistory.total', { total }) }}</span>
           <div class="flex items-center gap-2">
-            <button class="btn-secondary" :disabled="page <= 1" @click="page--; load()">{{ t('admin.accounts.modeltraceHistory.prev') }}</button>
+            <button class="btn btn-secondary" :disabled="page <= 1" @click="page--; load()">{{ t('admin.accounts.modeltraceHistory.prev') }}</button>
             <span class="text-gray-500 dark:text-gray-400">{{ page }} / {{ totalPages }}</span>
-            <button class="btn-secondary" :disabled="page >= totalPages" @click="page++; load()">{{ t('admin.accounts.modeltraceHistory.next') }}</button>
+            <button class="btn btn-secondary" :disabled="page >= totalPages" @click="page++; load()">{{ t('admin.accounts.modeltraceHistory.next') }}</button>
           </div>
         </div>
       </template>
