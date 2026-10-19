@@ -65,3 +65,8 @@ export async function history(id: number, params: { model?: string; filter?: str
   const { data } = await apiClient.get(`${base(id)}/codex-ticket-history`, { params })
   return data
 }
+
+export async function deleteHistory(id: number, params: { model?: string; filter?: string }): Promise<{ deleted: number }> {
+  const { data } = await apiClient.delete(`${base(id)}/codex-ticket-history`, { params })
+  return data
+}

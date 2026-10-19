@@ -45,8 +45,8 @@ func (h *AccountHandler) GetCodexTicketHistory(c *gin.Context) {
 	}
 	model := c.Query("model")
 	filter := c.DefaultQuery("filter", "all")
-	if filter != "all" && filter != "success" {
-		response.BadRequest(c, "filter must be all or success")
+	if filter != "all" && filter != "success" && filter != "failed" {
+		response.BadRequest(c, "filter must be all, success or failed")
 		return
 	}
 	page, size := response.ParsePagination(c)
@@ -57,12 +57,37 @@ func (h *AccountHandler) GetCodexTicketHistory(c *gin.Context) {
 		codexTicketError(c, service.ErrCodexTicketUnavailable)
 		return
 	}
-	rows, total, err := h.codexTicketAttempts.List(c.Request.Context(), id, model, filter == "success", page, size)
+	rows, total, err := h.codexTicketAttempts.List(c.Request.Context(), id, model, filter, page, size)
 	if err != nil {
 		codexTicketError(c, err)
 		return
 	}
 	response.Success(c, gin.H{"items": rows, "total": total, "page": page, "page_size": size})
+}
+
+// DeleteCodexTicketHistory clears persisted ModelTrace diagnostic attempts for
+// one account (optionally narrowed by model and outcome filter) to reclaim disk.
+func (h *AccountHandler) DeleteCodexTicketHistory(c *gin.Context) {
+	id, ok := codexTicketAccountID(c)
+	if !ok {
+		return
+	}
+	model := c.Query("model")
+	filter := c.DefaultQuery("filter", "all")
+	if filter != "all" && filter != "success" && filter != "failed" {
+		response.BadRequest(c, "filter must be all, success or failed")
+		return
+	}
+	if h.codexTicketAttempts == nil {
+		codexTicketError(c, service.ErrCodexTicketUnavailable)
+		return
+	}
+	deleted, err := h.codexTicketAttempts.Delete(c.Request.Context(), id, model, filter)
+	if err != nil {
+		codexTicketError(c, err)
+		return
+	}
+	response.Success(c, gin.H{"deleted": deleted})
 }
 
 // GetCodexFingerprintVersion reports the active ModelTrace bank commit and

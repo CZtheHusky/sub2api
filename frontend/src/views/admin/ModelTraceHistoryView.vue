@@ -2,19 +2,14 @@
   <AppLayout>
     <TablePageLayout>
       <template #actions>
-        <div class="flex flex-wrap items-center justify-between gap-3">
-          <div class="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+        <div class="flex flex-wrap items-center justify-end gap-2">
+          <button class="btn-secondary inline-flex items-center gap-1.5 whitespace-nowrap" @click="loadFingerprint">
             <Icon name="sparkles" size="sm" class="text-violet-500" />
-            {{ t('admin.accounts.modeltraceHistory.description') }}
-          </div>
-          <div class="flex items-center gap-2">
-            <button class="btn-secondary" @click="loadFingerprint">
-              {{ t('admin.accounts.modeltraceHistory.bank') }}: {{ fingerprintCommit ? fingerprintCommit.slice(0, 10) : '…' }}
-            </button>
-            <button class="btn-primary" :disabled="refreshingBank" @click="refreshBank">
-              {{ refreshingBank ? t('admin.accounts.modeltraceHistory.refreshing') : t('admin.accounts.modeltraceHistory.refreshBank') }}
-            </button>
-          </div>
+            {{ t('admin.accounts.modeltraceHistory.bank') }}: {{ fingerprintCommit ? fingerprintCommit.slice(0, 10) : '…' }}
+          </button>
+          <button class="btn-primary shrink-0 whitespace-nowrap" :disabled="refreshingBank" @click="refreshBank">
+            {{ refreshingBank ? t('admin.accounts.modeltraceHistory.refreshing') : t('admin.accounts.modeltraceHistory.refreshBank') }}
+          </button>
         </div>
       </template>
 
@@ -34,20 +29,25 @@
             <select v-model="outcomeFilter" class="input" @change="reload">
               <option value="all">{{ t('admin.accounts.modeltraceHistory.filterAll') }}</option>
               <option value="success">{{ t('admin.accounts.modeltraceHistory.filterSuccess') }}</option>
+              <option value="failed">{{ t('admin.accounts.modeltraceHistory.filterFailed') }}</option>
             </select>
           </div>
-          <button class="btn-primary" @click="reload">{{ t('admin.accounts.modeltraceHistory.query') }}</button>
+          <button class="btn-primary shrink-0 whitespace-nowrap" :disabled="loading" @click="reload">{{ t('admin.accounts.modeltraceHistory.query') }}</button>
+          <button v-if="accountId" class="btn-danger ml-auto shrink-0 whitespace-nowrap" :disabled="loading" @click="showDeleteDialog = true">
+            {{ t('admin.accounts.modeltraceHistory.deleteRecords') }}
+          </button>
         </div>
+        <div v-if="notice" class="mt-2 text-sm text-green-600 dark:text-green-400">{{ notice }}</div>
       </template>
 
       <template #table>
-        <div v-if="!accountId" class="table-wrapper p-10 text-center text-sm text-gray-400">
+        <div v-if="!accountId" class="flex min-h-40 items-center justify-center p-10 text-sm text-gray-400">
           {{ t('admin.accounts.modeltraceHistory.selectFirst') }}
         </div>
-        <div v-else-if="loading" class="table-wrapper p-10 text-center text-sm text-gray-400">
+        <div v-else-if="loading" class="flex min-h-40 items-center justify-center p-10 text-sm text-gray-400">
           {{ t('admin.accounts.modeltraceHistory.loading') }}
         </div>
-        <div v-else-if="!items.length" class="table-wrapper p-10 text-center text-sm text-gray-400">
+        <div v-else-if="!items.length" class="flex min-h-40 items-center justify-center p-10 text-sm text-gray-400">
           {{ t('admin.accounts.modeltraceHistory.empty') }}
         </div>
         <div v-else class="table-wrapper">
@@ -109,6 +109,17 @@
         </dl>
       </div>
     </div>
+    <!-- 删除确认 -->
+    <ConfirmDialog
+      :show="showDeleteDialog"
+      :title="t('admin.accounts.modeltraceHistory.deleteRecords')"
+      :message="deleteConfirmMessage"
+      :confirm-text="t('common.delete')"
+      :cancel-text="t('common.cancel')"
+      :danger="true"
+      @confirm="confirmDelete"
+      @cancel="showDeleteDialog = false"
+    />
   </AppLayout>
 </template>
 
@@ -120,9 +131,10 @@ import * as tickets from '@/api/admin/codexTickets'
 import type { TicketAttempt } from '@/api/admin/codexTickets'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import TablePageLayout from '@/components/layout/TablePageLayout.vue'
+import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Icon from '@/components/icons/Icon.vue'
 
-const { t, locale } = useI18n()
+const { t, te, locale } = useI18n()
 
 interface AccountOption { id: number; name: string }
 
@@ -138,12 +150,20 @@ const loading = ref(false)
 const selected = ref<TicketAttempt | null>(null)
 const fingerprintCommit = ref('')
 const refreshingBank = ref(false)
+const showDeleteDialog = ref(false)
+const deleting = ref(false)
+const notice = ref('')
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 
 async function loadAccounts() {
   const { data } = await apiClient.get<{ items: AccountOption[] }>('/admin/accounts', { params: { page: 1, page_size: 200, platform: 'openai' } })
   accounts.value = data.items || []
+  // 默认选中第一个账号并自动查询，避免打开页面时误以为无数据
+  if (!accountId.value && accounts.value.length) {
+    accountId.value = accounts.value[0].id
+    load()
+  }
 }
 
 async function loadFingerprint() {
@@ -163,6 +183,41 @@ async function refreshBank() {
   }
 }
 
+const currentAccountName = computed(() => accounts.value.find(a => a.id === accountId.value)?.name || `#${accountId.value}`)
+
+const deleteScope = computed(() => {
+  const filterKey = outcomeFilter.value === 'success' ? 'filterSuccess' : outcomeFilter.value === 'failed' ? 'filterFailed' : 'filterAll'
+  let scope = t(`admin.accounts.modeltraceHistory.${filterKey}`)
+  const model = modelFilter.value.trim()
+  if (model) scope += ` / ${model}`
+  return scope
+})
+
+const deleteConfirmMessage = computed(() => t('admin.accounts.modeltraceHistory.deleteConfirm', { name: currentAccountName.value, scope: deleteScope.value }))
+
+async function confirmDelete() {
+  if (!accountId.value || deleting.value) return
+  deleting.value = true
+  try {
+    const { deleted } = await tickets.deleteHistory(accountId.value, {
+      model: modelFilter.value.trim() || undefined,
+      filter: outcomeFilter.value
+    })
+    showDeleteDialog.value = false
+    notice.value = t('admin.accounts.modeltraceHistory.deleted', { count: deleted })
+    reload()
+  } finally {
+    deleting.value = false
+  }
+}
+
+function triggerLabel(row: TicketAttempt) {
+  const v = row.trigger
+  if (!v) return '—'
+  const key = `admin.accounts.modeltraceHistory.trigger_${v}`
+  return te(key) ? t(key) : v
+}
+
 async function load() {
   if (!accountId.value) return
   loading.value = true
@@ -180,7 +235,7 @@ async function load() {
   }
 }
 
-function reload() { page.value = 1; load() }
+function reload() { notice.value = ''; page.value = 1; load() }
 
 function formatTime(v: string) {
   const d = new Date(v)
@@ -208,7 +263,7 @@ const detailRows = computed<Record<string, string>>(() => {
     [t('admin.accounts.modeltraceHistory.colTime')]: formatTime(row.occurred_at),
     [t('admin.accounts.modeltraceHistory.colModel')]: row.model,
     [t('admin.accounts.modeltraceHistory.detailOutcome')]: row.outcome,
-    [t('admin.accounts.modeltraceHistory.detailTrigger')]: row.trigger || '—',
+    [t('admin.accounts.modeltraceHistory.detailTrigger')]: triggerLabel(row),
     [t('admin.accounts.modeltraceHistory.colVerdict')]: verdictLabel(row),
     [t('admin.accounts.modeltraceHistory.colPredicted')]: row.fingerprint_predicted_model || '—',
     [t('admin.accounts.modeltraceHistory.colProbability')]: row.fingerprint_probability != null ? (row.fingerprint_probability * 100).toFixed(2) + '%' : '—',

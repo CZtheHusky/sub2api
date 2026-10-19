@@ -10,6 +10,7 @@ export default {
         "modelFilter": "按模型名过滤",
         "filterAll": "全部",
         "filterSuccess": "仅成功",
+        "filterFailed": "仅失败",
         "query": "查询",
         "selectFirst": "请先选择一个账号",
         "loading": "加载中…",
@@ -38,7 +39,13 @@ export default {
         "detailHttpStatus": "HTTP 状态",
         "detailDuration": "耗时(ms)",
         "detailReason": "原因码",
-        "detailVerification": "验证方式"
+        "detailVerification": "验证方式",
+        "deleteRecords": "清空记录",
+        "deleteConfirm": "确定删除账号 {name} 的检测记录吗？范围：{scope}。此操作不可恢复。",
+        "deleted": "已删除 {count} 条记录",
+        "trigger_diagnostic": "手动诊断",
+        "trigger_automatic": "自动收割",
+        "trigger_manual": "手动"
       },
 
       codexDiagnosticDialog: {

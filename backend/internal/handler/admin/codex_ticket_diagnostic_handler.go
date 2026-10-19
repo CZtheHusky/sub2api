@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -169,86 +170,125 @@ func (h *AccountHandler) diagnoseCodexModels(c *gin.Context, generateChallenge f
 		if c.Request.Context().Err() != nil {
 			break
 		}
-		item := codexDiagnosticItem{Model: model, Status: "failed"}
-		probeCtx, templateErr := h.codexTicketGateway.PrepareCodexProbeContext(c.Request.Context())
-		if templateErr != nil {
-			item.Reason = "template_unavailable"
-			if errors.Is(templateErr, service.ErrCodexProbeTemplateInvalid) {
-				item.Reason = "template_invalid"
+		item, attempt := h.diagnoseCodexModel(c, accountID, model, key.Key, generateChallenge)
+		if attempt != nil && h.codexTicketAttempts != nil {
+			// 落库不阻断诊断结果：用脱离请求生命周期的上下文，避免客户端断开导致丢失记录
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+			if err := h.codexTicketAttempts.Insert(ctx, attempt); err != nil {
+				slog.Warn("codex_ticket_attempt_insert_failed", "account_id", accountID, "model", model, "error", err)
 			}
-			results = append(results, item)
-			continue
-		}
-		challenge, challengeErr := generateChallenge()
-		if challengeErr != nil {
-			item.Reason = "challenge_generation_failed"
-			results = append(results, item)
-			continue
-		}
-		body, probeHeaders, buildErr := h.codexTicketGateway.BuildCodexDiagnosticRequest(probeCtx, accountID, model, challenge)
-		if buildErr != nil {
-			item.Reason = "request_build_failed"
-			if errors.Is(buildErr, service.ErrCodexProbeIdentity) {
-				item.Reason = "identity_resolution_failed"
-			}
-			results = append(results, item)
-			continue
-		}
-		// The normal gateway owns ticket policy, scheduling, injection and invalidation.
-		// Diagnostics only pin the target account and analyze the model response.
-		modelCtx, cancel := context.WithTimeout(service.WithCodexTicketDiagnostic(probeCtx, accountID), 120*time.Second)
-		request, requestErr := http.NewRequestWithContext(modelCtx, http.MethodPost, "/v1/responses", bytes.NewReader(body))
-		if requestErr != nil {
 			cancel()
-			item.Reason = "request_build_failed"
-			results = append(results, item)
-			continue
-		}
-		for name, values := range probeHeaders {
-			request.Header[name] = values
-		}
-		request.Header.Set("Authorization", "Bearer "+key.Key)
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("Accept", "text/event-stream")
-		request.RemoteAddr = c.Request.RemoteAddr
-		request.Host = c.Request.Host
-		writer := httptest.NewRecorder()
-		h.codexTicketRouter.ServeHTTP(writer, request)
-		cancel()
-		item.HTTPStatus = writer.Code
-		if writer.Code < 200 || writer.Code >= 300 {
-			item.Reason = "gateway_request_failed"
-			item.GatewayErrorCode = codexDiagnosticGatewayError(writer.Body.Bytes())
-			results = append(results, item)
-			continue
-		}
-		output, readErr := io.ReadAll(io.LimitReader(writer.Body, 2<<20))
-		if readErr != nil {
-			item.Reason = "response_read_failed"
-			results = append(results, item)
-			continue
-		}
-		diagnosticText, complete := codexDiagnosticOutput(output)
-		if !complete {
-			item.Reason = "response_incomplete"
-			results = append(results, item)
-			continue
-		}
-		prediction, _, predictErr := service.ModelTracePredictCommitted(diagnosticText, challenge.ExpectedCount)
-		item.ParsedCount = prediction.ParsedCount
-		if predictErr != nil {
-			item.Reason = "insufficient_numbers"
-			results = append(results, item)
-			continue
-		}
-		item.PredictedModel, item.Probability = prediction.Model, prediction.Probability
-		if prediction.Model == model {
-			item.Status = "normal"
-		} else {
-			item.Status = "degraded"
-			item.Reason = "fingerprint_mismatch"
 		}
 		results = append(results, item)
 	}
 	response.Success(c, gin.H{"items": results, "canceled": c.Request.Context().Err() != nil})
+}
+
+// diagnoseCodexModel probes a single model through the in-process gateway.
+// The attempt is returned for history persistence only when the probe was
+// actually dispatched to the gateway (pre-flight failures are not recorded).
+func (h *AccountHandler) diagnoseCodexModel(c *gin.Context, accountID int64, model, apiKey string, generateChallenge func() (service.ModelTraceChallenge, error)) (codexDiagnosticItem, *service.CodexTicketAttempt) {
+	item := codexDiagnosticItem{Model: model, Status: "failed"}
+	probeCtx, templateErr := h.codexTicketGateway.PrepareCodexProbeContext(c.Request.Context())
+	if templateErr != nil {
+		item.Reason = "template_unavailable"
+		if errors.Is(templateErr, service.ErrCodexProbeTemplateInvalid) {
+			item.Reason = "template_invalid"
+		}
+		return item, nil
+	}
+	challenge, challengeErr := generateChallenge()
+	if challengeErr != nil {
+		item.Reason = "challenge_generation_failed"
+		return item, nil
+	}
+	body, probeHeaders, buildErr := h.codexTicketGateway.BuildCodexDiagnosticRequest(probeCtx, accountID, model, challenge)
+	if buildErr != nil {
+		item.Reason = "request_build_failed"
+		if errors.Is(buildErr, service.ErrCodexProbeIdentity) {
+			item.Reason = "identity_resolution_failed"
+		}
+		return item, nil
+	}
+	// The normal gateway owns ticket policy, scheduling, injection and invalidation.
+	// Diagnostics only pin the target account and analyze the model response.
+	modelCtx, cancel := context.WithTimeout(service.WithCodexTicketDiagnostic(probeCtx, accountID), 120*time.Second)
+	request, requestErr := http.NewRequestWithContext(modelCtx, http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	if requestErr != nil {
+		cancel()
+		item.Reason = "request_build_failed"
+		return item, nil
+	}
+	for name, values := range probeHeaders {
+		request.Header[name] = values
+	}
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	request.RemoteAddr = c.Request.RemoteAddr
+	request.Host = c.Request.Host
+	start := time.Now()
+	writer := httptest.NewRecorder()
+	h.codexTicketRouter.ServeHTTP(writer, request)
+	cancel()
+
+	code := writer.Code
+	expectedCount := challenge.ExpectedCount
+	attempt := &service.CodexTicketAttempt{
+		AccountID:              accountID,
+		Model:                  model,
+		OccurredAt:             start,
+		Outcome:                "error",
+		Trigger:                "diagnostic",
+		HTTPStatus:             &code,
+		DurationMS:             int(time.Since(start).Milliseconds()),
+		ReasonCode:             "gateway_request_failed",
+		VerificationMethod:     "modeltrace",
+		FingerprintCommit:      service.ModelTraceBankCommit(),
+		ChallengeExpectedCount: &expectedCount,
+	}
+	item.HTTPStatus = code
+	if code < 200 || code >= 300 {
+		item.GatewayErrorCode = codexDiagnosticGatewayError(writer.Body.Bytes())
+		return item, attempt
+	}
+	output, readErr := io.ReadAll(io.LimitReader(writer.Body, 2<<20))
+	if readErr != nil {
+		item.Reason = "response_read_failed"
+		attempt.ReasonCode = item.Reason
+		return item, attempt
+	}
+	diagnosticText, complete := codexDiagnosticOutput(output)
+	if !complete {
+		item.Reason = "response_incomplete"
+		attempt.Outcome = "miss"
+		attempt.ReasonCode = item.Reason
+		return item, attempt
+	}
+	prediction, _, predictErr := service.ModelTracePredictCommitted(diagnosticText, challenge.ExpectedCount)
+	item.ParsedCount = prediction.ParsedCount
+	attempt.ParsedNumberCount = &prediction.ParsedCount
+	if predictErr != nil {
+		item.Reason = "insufficient_numbers"
+		attempt.Outcome = "success"
+		attempt.ReasonCode = item.Reason
+		return item, attempt
+	}
+	item.PredictedModel, item.Probability = prediction.Model, prediction.Probability
+	attempt.Outcome = "success"
+	attempt.ReasonCode = ""
+	attempt.FingerprintPredictedModel = prediction.Model
+	attempt.FingerprintProbability = &prediction.Probability
+	if prediction.Model == model {
+		item.Status = "normal"
+		matched := true
+		attempt.FingerprintMatched = &matched
+	} else {
+		item.Status = "degraded"
+		item.Reason = "fingerprint_mismatch"
+		matched := false
+		attempt.FingerprintMatched = &matched
+		attempt.ReasonCode = item.Reason
+	}
+	return item, attempt
 }

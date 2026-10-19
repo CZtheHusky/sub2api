@@ -10,6 +10,7 @@ export default {
         "modelFilter": "Filter by model",
         "filterAll": "All",
         "filterSuccess": "Success only",
+        "filterFailed": "Failed only",
         "query": "Query",
         "selectFirst": "Select an account first",
         "loading": "Loading…",
@@ -38,7 +39,13 @@ export default {
         "detailHttpStatus": "HTTP status",
         "detailDuration": "Duration (ms)",
         "detailReason": "Reason code",
-        "detailVerification": "Verification"
+        "detailVerification": "Verification",
+        "deleteRecords": "Clear records",
+        "deleteConfirm": "Delete diagnostic records of {name}? Scope: {scope}. This cannot be undone.",
+        "deleted": "Deleted {count} records",
+        "trigger_diagnostic": "Manual diagnostic",
+        "trigger_automatic": "Automatic harvest",
+        "trigger_manual": "Manual"
       },
 
       codexDiagnosticDialog: {
