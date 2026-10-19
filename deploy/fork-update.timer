@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Sub2API fork update check daily
+
+[Timer]
+OnCalendar=*-*-* 04:40:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

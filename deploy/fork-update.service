@@ -1,0 +1,6 @@
+[Unit]
+Description=Sub2API fork auto update check (CZtheHusky/sub2api releases)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fork-update.sh

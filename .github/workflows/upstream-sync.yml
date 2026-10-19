@@ -1,0 +1,103 @@
+name: Upstream Sync
+
+# 每日同步 Wei-Shaw/sub2api main（合并本 fork 的降智检测改动），合并干净则：
+#   push main -> 打 tag v<VERSION>-fork.<yyyymmdd> -> 显式 dispatch release.yml 发版
+# 注意：GITHUB_TOKEN 推送的 tag 不会触发其他 workflow，因此最后一步用 gh workflow run 显式触发。
+# 合并冲突时：放弃合并、开/更新 issue 通知，不推送半成品。
+
+on:
+  schedule:
+    - cron: '23 10 * * *' # 每日 10:23 UTC（VPS 更新窗口前约 1 小时，避开整点）
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Force a new fork release even if upstream is unchanged'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: upstream-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+env:
+  UPSTREAM_URL: https://github.com/Wei-Shaw/sub2api.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: git fetch --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+
+      - name: Check whether sync is needed
+        id: check
+        run: |
+          if git merge-base --is-ancestor FETCH_HEAD HEAD && [ "${{ inputs.force_release }}" != "true" ]; then
+            echo "Already up to date with upstream ${UPSTREAM_BRANCH}"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream into main
+        id: merge
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Upstream already merged; skipping merge (force release path)"
+            exit 0
+          fi
+          if ! git merge --no-edit FETCH_HEAD; then
+            git merge --abort || true
+            echo "::error::Merge conflict with ${UPSTREAM_URL} ${UPSTREAM_BRANCH}"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Report merge conflict as issue
+        if: failure() && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="upstream-sync: merge conflict with Wei-Shaw/sub2api"
+          body="自动合并上游 main 失败，需要人工解决冲突。%0A%0A工作流运行：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          existing=$(gh issue list --state open --limit 20 --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1 || true)
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body "${body}"
+          else
+            gh issue create --title "${title}" --body "${body}"
+          fi
+
+      - name: Push main, tag, and trigger release
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git push origin HEAD:main
+          version=$(tr -d '\r\n' < backend/cmd/server/VERSION)
+          tag="v${version}-fork.$(date -u +%Y%m%d)"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            tag="${tag}-$(git rev-parse --short HEAD)"
+          fi
+          git tag "${tag}"
+          git push origin "refs/tags/${tag}"
+          echo "Tagged and pushed ${tag}"
+          gh workflow run release.yml -f tag="${tag}" -f simple_release=false -f dry_run=false

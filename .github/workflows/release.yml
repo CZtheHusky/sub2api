@@ -377,7 +377,8 @@ jobs:
 
   sync-version-file:
     needs: [prepare, release]
-    if: ${{ needs.release.result == 'success' && needs.prepare.outputs.dry_run != 'true' }}
+    # fork 发布（tag 含 -fork 后缀）不回写 VERSION 到 main，避免与上游同步时反复冲突
+    if: ${{ needs.release.result == 'success' && needs.prepare.outputs.dry_run != 'true' && !contains(needs.prepare.outputs.tag, '-fork') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
