@@ -1,13 +1,12 @@
 name: Upstream Sync
 
-# 每日同步 Wei-Shaw/sub2api main（合并本 fork 的降智检测改动），合并干净则：
+# 同步 Wei-Shaw/sub2api main（合并本 fork 的降智检测改动），合并干净则：
 #   push main -> 打 tag v<VERSION>-fork.<yyyymmdd> -> 显式 dispatch release.yml 发版
 # 注意：GITHUB_TOKEN 推送的 tag 不会触发其他 workflow，因此最后一步用 gh workflow run 显式触发。
 # 合并冲突时：放弃合并、开/更新 issue 通知，不推送半成品。
+# 仅手动触发（每日定时已禁用）：gh workflow run upstream-sync.yml [-f force_release=true]
 
 on:
-  schedule:
-    - cron: '23 10 * * *' # 每日 10:23 UTC（VPS 更新窗口前约 1 小时，避开整点）
   workflow_dispatch:
     inputs:
       force_release:
