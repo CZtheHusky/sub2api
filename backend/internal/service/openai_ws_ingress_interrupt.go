@@ -18,10 +18,13 @@ const (
 	openAIWSInterruptFailed    = "response.interrupt.failed"
 	openAIWSInterruptMode      = "discard_partial_items"
 	// Codex 0.170 allows one second to drain a canceled response.
-	openAIWSInterruptAckTimeout = time.Second
+	openAIWSInterruptTimeout = time.Second
 )
 
-var errOpenAIWSInterruptAckTimeout = errors.New("upstream websocket interruption acknowledgement timed out")
+var (
+	errOpenAIWSInterruptTimeout  = errors.New("upstream websocket interruption timed out")
+	errOpenAIWSInterruptRejected = errors.New("upstream websocket interruption was rejected")
+)
 
 // openAIWSIngressInterrupt keeps at most one client read outstanding across
 // turns. Only the forwarding loop consumes reads and writes control frames.
@@ -37,10 +40,9 @@ type openAIWSIngressInterrupt struct {
 }
 
 type openAIWSInterruptTurn struct {
-	responseID  string
-	sent        bool
-	awaitingAck bool
-	ackDeadline time.Time
+	responseID     string
+	awaitingAck    bool
+	cancelDeadline time.Time
 }
 
 func (r *openAIWSIngressInterrupt) startRead() {
@@ -139,14 +141,15 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 			var err error
 			if !valid || turn.responseID != id {
 				err = writeOpenAIWSInterruptFailed(writeClient, id)
-			} else if !turn.sent {
-				err = lease.WriteJSONWithContextTimeout(r.ctx, map[string]string{
+			} else if turn.cancelDeadline.IsZero() {
+				turn.cancelDeadline = time.Now().Add(openAIWSInterruptTimeout)
+				writeCtx, cancelWrite := context.WithDeadline(r.ctx, turn.cancelDeadline)
+				err = lease.WriteJSONWithContextTimeout(writeCtx, map[string]string{
 					"type": openAIWSInterruptRequested, "response_id": id, "mode": openAIWSInterruptMode,
 				}, writeTimeout)
+				cancelWrite()
 				if err == nil {
-					turn.sent = true
 					turn.awaitingAck = true
-					turn.ackDeadline = time.Now().Add(openAIWSInterruptAckTimeout)
 					resetDeadline()
 				}
 			}
@@ -198,13 +201,13 @@ func openAIWSHasDuplicateMessageType(payload []byte) bool {
 
 func (r *openAIWSIngressInterrupt) readDeadline(turn *openAIWSInterruptTurn) (time.Time, error) {
 	if !r.drainDeadline.IsZero() {
-		if turn.awaitingAck && turn.ackDeadline.Before(r.drainDeadline) {
-			return turn.ackDeadline, context.Canceled
+		if !turn.cancelDeadline.IsZero() && turn.cancelDeadline.Before(r.drainDeadline) {
+			return turn.cancelDeadline, context.Canceled
 		}
 		return r.drainDeadline, context.Canceled
 	}
-	if turn.awaitingAck {
-		return turn.ackDeadline, errOpenAIWSInterruptAckTimeout
+	if !turn.cancelDeadline.IsZero() {
+		return turn.cancelDeadline, errOpenAIWSInterruptTimeout
 	}
 	return time.Time{}, nil
 }
@@ -229,27 +232,39 @@ func (t *openAIWSInterruptTurn) recordAck(kind string, payload []byte) error {
 }
 
 func (r *openAIWSIngressInterrupt) finishTurn(lease *openAIWSConnLease, turn *openAIWSInterruptTurn, readTimeout, writeTimeout time.Duration, writeClient func([]byte) error) error {
-	payload, err := r.readUpstream(lease, turn, readTimeout, writeTimeout, writeClient)
-	if err != nil {
-		return err
-	}
-	if !r.drainDeadline.IsZero() {
-		return context.Canceled
-	}
-	kind := gjson.GetBytes(payload, "type").String()
-	switch kind {
-	case openAIWSInterruptAccepted, openAIWSInterruptFailed:
-		if err := turn.recordAck(kind, payload); err != nil {
+	for {
+		payload, err := r.readUpstream(lease, turn, readTimeout, writeTimeout, writeClient)
+		if err != nil {
 			return err
 		}
-		return writeClient(payload)
-	case "error":
-		if err := writeClient(payload); err != nil {
-			return err
+		if !r.drainDeadline.IsZero() {
+			return context.Canceled
 		}
-		return errors.New("upstream websocket error while awaiting interruption acknowledgement")
-	default:
-		return fmt.Errorf("unexpected websocket event %q after terminal while awaiting interruption acknowledgement", kind)
+		kind := gjson.GetBytes(payload, "type").String()
+		switch kind {
+		case openAIWSInterruptAccepted, openAIWSInterruptFailed:
+			if err := turn.recordAck(kind, payload); err != nil {
+				return err
+			}
+			if err := writeClient(payload); err != nil {
+				return err
+			}
+			if kind == openAIWSInterruptFailed {
+				return errOpenAIWSInterruptRejected
+			}
+			return nil
+		case "codex.response.metadata", "codex.rate_limits":
+			if err := writeClient(payload); err != nil {
+				return err
+			}
+		case "error":
+			if err := writeClient(payload); err != nil {
+				return err
+			}
+			return errors.New("upstream websocket error while awaiting interruption acknowledgement")
+		default:
+			return fmt.Errorf("unexpected websocket event %q after terminal while awaiting interruption acknowledgement", kind)
+		}
 	}
 }
 

@@ -224,6 +224,7 @@ func codexSmokeResponsesEventsForItem(responseID, item string) []string {
 
 func testCodexSmokeRemoteCompaction(t *testing.T, binary string) {
 	t.Helper()
+	const compactionID = "cmp_smoke"
 	const compactedHistory = "opaque-test-content"
 	type request struct {
 		kind    string
@@ -248,7 +249,7 @@ func testCodexSmokeRemoteCompaction(t *testing.T, binary string) {
 		mu.Unlock()
 		events := codexSmokeResponsesEvents("resp_http", true)
 		if service.HasCompactionTriggerInInput(payload) {
-			item := fmt.Sprintf(`{"id":"cmp_smoke","type":"compaction","encrypted_content":%q}`, compactedHistory)
+			item := fmt.Sprintf(`{"id":%q,"type":"compaction","encrypted_content":%q}`, compactionID, compactedHistory)
 			events = codexSmokeResponsesEventsForItem("resp_compact", item)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -315,7 +316,9 @@ func testCodexSmokeRemoteCompaction(t *testing.T, binary string) {
 	require.NotEmpty(t, items)
 	require.Equal(t, "compaction_trigger", items[len(items)-1].Get("type").String())
 	require.Equal(t, "turn", requests[2].kind)
-	require.Equal(t, compactedHistory, gjson.GetBytes(requests[2].payload, `input.#(type=="compaction").encrypted_content`).String())
+	compaction := gjson.GetBytes(requests[2].payload, `input.#(type=="compaction")`)
+	require.Equal(t, compactionID, compaction.Get("id").String())
+	require.Equal(t, compactedHistory, compaction.Get("encrypted_content").String())
 }
 
 func TestOpenAIResponsesWebSocket_UpstreamMessageTooBigDoesNotReplay(t *testing.T) {
@@ -435,6 +438,6 @@ remote_compaction = "v2"
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "SUB2API_SMOKE_KEY=" + smokeClient}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "TMPDIR=" + t.TempDir(), "SUB2API_SMOKE_KEY=" + smokeClient}
 	return cmd
 }

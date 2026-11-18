@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +52,8 @@ const (
 	interruptTestCreated  = `{"type":"response.created","response":{"id":"resp_active","status":"in_progress"}}`
 	interruptTestComplete = `{"type":"response.completed","response":{"id":"resp_active","status":"completed","usage":{"input_tokens":11,"output_tokens":2}}}`
 	interruptTestAck      = `{"type":"response.interrupt.accepted","response_id":"resp_active"}`
+	interruptTestReject   = `{"type":"response.interrupt.failed","response_id":"resp_active"}`
+	interruptTestMetadata = `{"type":"codex.response.metadata","headers":{"x-models-etag":"interrupt-smoke"}}`
 	interruptTestControl  = `{"type":"response.interrupt","response_id":"resp_active","mode":"discard_partial_items"}`
 )
 
@@ -112,6 +116,8 @@ func TestOpenAIWSOAuthCtxPoolInterruptStaysOnActiveResponse(t *testing.T) {
 			} else {
 				upstream.Send(interruptTestComplete)
 				requireInterruptDownstream(t, client, interruptTestComplete)
+				upstream.Send(interruptTestMetadata)
+				requireInterruptDownstream(t, client, interruptTestMetadata)
 				writeInterruptTestClient(t, client, secondCreate)
 				select {
 				case frame := <-upstream.writes:
@@ -142,6 +148,174 @@ func TestOpenAIWSOAuthCtxPoolInterruptStaysOnActiveResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpenAIWSOAuthCtxPoolInterruptRejectedDiscardsLease(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		terminalSeen bool
+	}{
+		{name: "rejection first"},
+		{name: "terminal first", terminalSeen: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &interruptTestConn{newStagedPassthroughConn()}
+			replacement := &interruptTestConn{newStagedPassthroughConn()}
+			svc, account, dialer := newInterruptTestService(t, upstream, replacement)
+			billed := make(chan *OpenAIForwardResult, 2)
+			server, done := startPassthroughLifecycleServerWithHooks(t, context.Background(), svc, account, func(*gin.Context) *OpenAIWSIngressHooks {
+				return &OpenAIWSIngressHooks{AfterTurn: func(_ int, result *OpenAIForwardResult, err error) {
+					if err == nil {
+						billed <- result
+					}
+				}}
+			})
+			defer server.Close()
+			client := dialPassthroughLifecycleClient(t, server)
+			defer func() { _ = client.CloseNow() }()
+			requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+			upstream.Send(interruptTestCreated)
+			requireInterruptDownstream(t, client, interruptTestCreated)
+			writeInterruptTestClient(t, client, interruptTestControl)
+			require.JSONEq(t, interruptTestControl, string(requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)))
+
+			if tc.terminalSeen {
+				upstream.Send(interruptTestComplete)
+				requireInterruptDownstream(t, client, interruptTestComplete)
+			}
+			upstream.Send(interruptTestReject)
+			if !tc.terminalSeen {
+				upstream.Send(interruptTestComplete)
+			}
+			requireInterruptDownstream(t, client, interruptTestReject)
+			_, clientErr := readPassthroughLifecycleFrame(t, client, 2*time.Second)
+			require.Equal(t, coderws.StatusInternalError, coderws.CloseStatus(clientErr))
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, errOpenAIWSInterruptRejected)
+			case <-time.After(2 * time.Second):
+				t.Fatal("upstream rejection did not finish the session")
+			}
+			if tc.terminalSeen {
+				require.Len(t, billed, 1)
+				result := <-billed
+				require.Equal(t, 11, result.Usage.InputTokens)
+				require.Equal(t, 2, result.Usage.OutputTokens)
+			} else {
+				require.Empty(t, billed)
+			}
+			select {
+			case <-upstream.closed:
+			default:
+				t.Fatal("rejected cancellation left the old lease open")
+			}
+
+			next := dialPassthroughLifecycleClient(t, server)
+			defer func() { _ = next.CloseNow() }()
+			create := requirePassthroughUpstreamWrite(t, replacement.stagedPassthroughConn, time.Second)
+			require.Equal(t, "response.create", gjson.GetBytes(create, "type").String())
+			require.Equal(t, 2, dialer.DialCount(), "a new session must dial after cancellation was rejected")
+			replacement.Send(interruptTestComplete)
+			requireInterruptDownstream(t, next, interruptTestComplete)
+			require.NoError(t, next.Close(coderws.StatusNormalClosure, ""))
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("client close did not finish the replacement session")
+			}
+		})
+	}
+}
+
+func TestOpenAIWSOAuthCtxPoolInterruptAcceptedWithoutTerminalDiscardsLease(t *testing.T) {
+	upstream := &interruptTestConn{newStagedPassthroughConn()}
+	svc, account, _ := newInterruptTestService(t, upstream)
+	server, done := startPassthroughLifecycleServer(t, context.Background(), svc, account)
+	defer server.Close()
+	client := dialPassthroughLifecycleClient(t, server)
+	defer func() { _ = client.CloseNow() }()
+	requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+	upstream.Send(interruptTestCreated)
+	requireInterruptDownstream(t, client, interruptTestCreated)
+	writeInterruptTestClient(t, client, interruptTestControl)
+	requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+	upstream.Send(interruptTestAck)
+	requireInterruptDownstream(t, client, interruptTestAck)
+
+	// Keep the client open so disconnect cleanup cannot release the lease.
+	select {
+	case <-upstream.closed:
+	case <-time.After(2 * openAIWSInterruptTimeout):
+		t.Fatal("accepted interrupt fell back to the ordinary upstream read timeout")
+	}
+	_, clientErr := readPassthroughLifecycleFrame(t, client, 2*time.Second)
+	require.Equal(t, coderws.StatusInternalError, coderws.CloseStatus(clientErr))
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errOpenAIWSInterruptTimeout)
+	case <-time.After(2 * time.Second):
+		t.Fatal("interrupt timeout did not finish the session")
+	}
+}
+
+func TestOpenAIWSOAuthCtxPoolInterruptBackpressureRetainsTerminalUsage(t *testing.T) {
+	upstream := &interruptTestConn{newStagedPassthroughConn()}
+	svc, account, _ := newInterruptTestService(t, upstream)
+	billed := make(chan *OpenAIForwardResult, 2)
+	server, done := startPassthroughLifecycleServerWithHooks(t, context.Background(), svc, account, func(*gin.Context) *OpenAIWSIngressHooks {
+		return &OpenAIWSIngressHooks{AfterTurn: func(_ int, result *OpenAIForwardResult, err error) {
+			if err == nil {
+				billed <- result
+			}
+		}}
+	})
+	defer server.Close()
+	dialer := &net.Dialer{}
+	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		if err := conn.(*net.TCPConn).SetReadBuffer(4096); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}}
+	defer transport.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &coderws.DialOptions{
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	require.NoError(t, err)
+	defer func() { _ = client.CloseNow() }()
+	writeInterruptTestClient(t, client, `{"type":"response.create","model":"gpt-5.1","stream":true}`)
+	requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+	upstream.Send(interruptTestCreated)
+	requireInterruptDownstream(t, client, interruptTestCreated)
+	writeInterruptTestClient(t, client, interruptTestControl)
+	requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+
+	// Keep the client open without reading a terminal frame larger than TCP can buffer.
+	upstream.Send(strings.TrimSuffix(interruptTestComplete, "}") + `,"padding":"` + strings.Repeat("x", 8<<20) + `"}`)
+	select {
+	case <-upstream.closed:
+	case <-time.After(2 * openAIWSInterruptTimeout):
+		t.Fatal("the downstream terminal write held the upstream lease past the interrupt deadline")
+	}
+	_ = client.CloseNow()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errOpenAIWSInterruptTimeout)
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal write timeout did not finish the session")
+	}
+	require.Len(t, billed, 1)
+	result := <-billed
+	require.Equal(t, 11, result.Usage.InputTokens)
+	require.Equal(t, 2, result.Usage.OutputTokens)
 }
 
 func TestOpenAIWSOAuthCtxPoolInterruptMissingAckDiscardsLease(t *testing.T) {
@@ -207,9 +381,26 @@ func TestOpenAIWSOAuthCtxPoolInterruptMissingAckCannotStartQueuedTurn(t *testing
 	upstream.Send(interruptTestComplete)
 	requireInterruptDownstream(t, client, interruptTestComplete)
 	writeInterruptTestClient(t, client, `{"type":"response.create","model":"gpt-5.1","stream":true}`)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(2 * openAIWSInterruptTimeout)
+waitForTimeout:
+	for {
+		select {
+		case <-ticker.C:
+			select {
+			case upstream.frames <- stagedPassthroughFrame{messageType: coderws.MessageText, payload: []byte(interruptTestMetadata)}:
+			default:
+			}
+		case <-upstream.closed:
+			break waitForTimeout
+		case <-deadline:
+			t.Fatal("metadata or a queued request extended the original interrupt deadline")
+		}
+	}
 	select {
 	case err := <-done:
-		require.ErrorIs(t, err, errOpenAIWSInterruptAckTimeout)
+		require.ErrorIs(t, err, errOpenAIWSInterruptTimeout)
 	case <-time.After(3 * time.Second):
 		t.Fatal("queued request blocked the interrupt deadline")
 	}

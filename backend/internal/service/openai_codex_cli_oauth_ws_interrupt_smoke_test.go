@@ -100,7 +100,7 @@ stream_max_retries = 0
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, "app-server", "--listen", "stdio://")
 	cmd.Dir = t.TempDir()
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + configDir, "SUB2API_TEST_TOKEN=sk-test"}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + configDir, "TMPDIR=" + t.TempDir(), "SUB2API_TEST_TOKEN=sk-test"}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	stdin, err := cmd.StdinPipe()

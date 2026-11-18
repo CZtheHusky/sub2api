@@ -487,11 +487,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}, nil
 	}
 
-	writeClientMessage := func(message []byte) error {
-		writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, s.openAIWSWriteTimeout())
+	writeClientWithTimeout := func(message []byte, timeout time.Duration) error {
+		writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, timeout)
 		defer cancel()
 		message = restoreCodexToolNamesFromContext(c, message)
 		return clientConn.Write(writeCtx, coderws.MessageText, message)
+	}
+	writeClientMessage := func(message []byte) error {
+		return writeClientWithTimeout(message, s.openAIWSWriteTimeout())
 	}
 
 	readClientMessage := func() ([]byte, error) {
@@ -1011,6 +1014,20 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 		responseID := ""
 		interruptTurn := openAIWSInterruptTurn{}
+		writeTurnMessage := func(message []byte) error {
+			if interruptTurn.cancelDeadline.IsZero() {
+				return writeClientMessage(message)
+			}
+			remaining := time.Until(interruptTurn.cancelDeadline)
+			if remaining <= 0 {
+				return errOpenAIWSInterruptTimeout
+			}
+			err := writeClientWithTimeout(message, min(remaining, s.openAIWSWriteTimeout()))
+			if err != nil && !time.Now().Before(interruptTurn.cancelDeadline) {
+				return errOpenAIWSInterruptTimeout
+			}
+			return err
+		}
 		usage := OpenAIUsage{}
 		imageCounter := newOpenAIImageOutputCounter()
 		var firstTokenMs *int
@@ -1044,13 +1061,17 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			var upstreamMessage []byte
 			var readErr error
 			if interruptReader != nil && interruptTurn.responseID != "" {
-				upstreamMessage, readErr = interruptReader.readUpstream(lease, &interruptTurn, s.openAIWSReadTimeout(), s.openAIWSWriteTimeout(), writeClientMessage)
+				upstreamMessage, readErr = interruptReader.readUpstream(lease, &interruptTurn, s.openAIWSReadTimeout(), s.openAIWSWriteTimeout(), writeTurnMessage)
 				clientDisconnected = clientDisconnected || !interruptReader.drainDeadline.IsZero()
 			} else {
 				upstreamMessage, readErr = lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
 			}
 			if readErr != nil {
-				lease.MarkBroken()
+				if interruptTurn.cancelDeadline.IsZero() {
+					lease.MarkBroken()
+				} else {
+					lease.abort()
+				}
 				if !wroteDownstream && coderws.CloseStatus(readErr) == coderws.StatusMessageTooBig {
 					closeErr := NewOpenAIWSClientCloseError(coderws.StatusMessageTooBig, openAIWSUpstreamMessageTooBigReason, readErr)
 					return nil, wrapOpenAIWSIngressTurnError("read_upstream", closeErr, false)
@@ -1068,6 +1089,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
 			if interruptReader != nil {
 				if err := interruptTurn.recordAck(eventType, upstreamMessage); err != nil {
+					lease.abort()
 					return nil, err
 				}
 			}
@@ -1204,6 +1226,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			imageCounter.AddSSEData(upstreamMessage)
 
+			var interruptionErr error
 			if !clientDisconnected {
 				if needModelReplace && len(mappedModelBytes) > 0 && openAIWSEventMayContainModel(eventType) && bytes.Contains(upstreamMessage, mappedModelBytes) {
 					upstreamMessage = replaceOpenAIWSMessageModel(upstreamMessage, mappedModel, originalModel)
@@ -1231,7 +1254,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 						clientMessage = rewritten
 					}
 				}
-				if err := writeClientMessage(clientMessage); err != nil {
+				if err := writeTurnMessage(clientMessage); err != nil {
 					if isOpenAIWSClientDisconnectError(err) {
 						clientDisconnected = true
 						if interruptReader != nil && interruptTurn.responseID != "" {
@@ -1246,6 +1269,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 							closeStatus,
 							truncateOpenAIWSLogValue(closeReason, openAIWSHeaderValueMaxLen),
 						)
+					} else if !interruptTurn.cancelDeadline.IsZero() {
+						lease.abort()
+						if !isTerminalEvent {
+							return nil, err
+						}
+						// The terminal usage above still belongs to this turn.
+						interruptionErr = err
 					} else {
 						return nil, wrapOpenAIWSIngressTurnError(
 							"write_client",
@@ -1261,14 +1291,17 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					markOpenAIWSClientVisibleFailure(c, eventType, upstreamMessage)
 				}
 			}
+			if interruptReader != nil && eventType == openAIWSInterruptFailed {
+				lease.abort()
+				return nil, errOpenAIWSInterruptRejected
+			}
 			if isTerminalEvent {
-				var interruptionErr error
-				if interruptTurn.awaitingAck {
+				if interruptionErr == nil && interruptTurn.awaitingAck {
 					if !clientDisconnected && (eventType == "response.completed" || eventType == "response.done") {
-						interruptionErr = interruptReader.finishTurn(lease, &interruptTurn, s.openAIWSReadTimeout(), s.openAIWSWriteTimeout(), writeClientMessage)
+						interruptionErr = interruptReader.finishTurn(lease, &interruptTurn, s.openAIWSReadTimeout(), s.openAIWSWriteTimeout(), writeTurnMessage)
 					}
 					if interruptTurn.awaitingAck || interruptionErr != nil {
-						lease.MarkBroken()
+						lease.abort()
 						if interruptionErr == nil && !clientDisconnected {
 							interruptionErr = errors.New("upstream websocket ended before interruption acknowledgement")
 						}

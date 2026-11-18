@@ -132,7 +132,7 @@ stream_max_retries = 0
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, "exec", "--skip-git-repo-check", "--ephemeral", "--json", prompt)
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "SUB2API_SMOKE_KEY=cli-fixture"}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "TMPDIR=" + t.TempDir(), "SUB2API_SMOKE_KEY=cli-fixture"}
 	output, err := cmd.Output()
 	if exit, ok := err.(*exec.ExitError); ok {
 		t.Logf("CLI stderr:\n%s", exit.Stderr)
@@ -177,6 +177,7 @@ stream_max_retries = 0
 			require.Contains(t, out.resp.Body.String(), `"text":"`+answer+`"`)
 			require.Equal(t, "application/json", out.header.Get("Content-Type"))
 			require.Equal(t, "text/event-stream", out.header.Get("Accept"))
+			require.Equal(t, "0.170.0", out.header.Get("Version"), "default OAuth upstream client version must match the accepted CLI version")
 			t.Logf("OAuth protocol headers: %v", out.header)
 			body := gjson.ParseBytes(out.body)
 			for _, field := range []string{"model", "stream", "input", "instructions", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "include", "store", "text", "service_tier", "prompt_cache_options"} {

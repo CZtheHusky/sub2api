@@ -188,7 +188,7 @@ stream_max_retries = 1
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binaryPath, "exec", "--skip-git-repo-check", "--ephemeral", "--json", "-")
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "SUB2API_TEST_TOKEN=sk-test"}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "TMPDIR=" + t.TempDir(), "SUB2API_TEST_TOKEN=sk-test"}
 	cmd.Stdin = strings.NewReader(prompt)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

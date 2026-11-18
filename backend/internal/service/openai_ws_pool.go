@@ -265,6 +265,15 @@ func (l *openAIWSConnLease) MarkBroken() {
 	l.pool.evictConn(l.accountID, l.conn.id)
 }
 
+func (l *openAIWSConnLease) abort() {
+	conn, err := l.activeConn()
+	if err != nil {
+		return
+	}
+	conn.abort()
+	l.MarkBroken()
+}
+
 func (l *openAIWSConnLease) Release() {
 	if l == nil || l.conn == nil {
 		return
