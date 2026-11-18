@@ -5,6 +5,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -197,18 +198,124 @@ func TestCodexCLIResponsesSmoke(t *testing.T) {
 			t.Logf("%s completed with %d upstream requests", tc.name, len(requests))
 		})
 	}
+	t.Run("RemoteCompaction", func(t *testing.T) {
+		testCodexSmokeRemoteCompaction(t, binary)
+	})
 }
 
 func codexSmokeResponsesEvents(responseID string, generate bool) []string {
+	item := ""
+	if generate {
+		item = fmt.Sprintf(`{"id":"msg_smoke","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":%q,"annotations":[]}]}`, smokeAnswer)
+	}
+	return codexSmokeResponsesEventsForItem(responseID, item)
+}
+
+func codexSmokeResponsesEventsForItem(responseID, item string) []string {
 	response := fmt.Sprintf(`"id":%q,"object":"response","created_at":1,"model":%q`, responseID, smokeModel)
 	events := []string{`{"type":"response.created","response":{` + response + `,"status":"in_progress","output":[]}}`}
 	output := "[]"
-	if generate {
-		item := fmt.Sprintf(`{"id":"msg_smoke","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":%q,"annotations":[]}]}`, smokeAnswer)
+	if item != "" {
 		events = append(events, `{"type":"response.output_item.done","item":`+item+`,"output_index":0}`)
 		output = "[" + item + "]"
 	}
 	return append(events, `{"type":"response.completed","response":{`+response+`,"status":"completed","output":`+output+`,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+}
+
+func testCodexSmokeRemoteCompaction(t *testing.T, binary string) {
+	t.Helper()
+	const compactedHistory = "opaque-test-content"
+	type request struct {
+		kind    string
+		payload []byte
+	}
+	var mu sync.Mutex
+	var requests []request
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/responses" || r.Header.Get("Authorization") != "Bearer "+smokeUpstream {
+			t.Errorf("unexpected upstream %s %s or credentials", r.Method, r.URL.Path)
+			http.Error(w, "unexpected upstream request", http.StatusBadRequest)
+			return
+		}
+		payload, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		kind := gjson.Get(r.Header.Get("X-Codex-Turn-Metadata"), "request_kind").String()
+		mu.Lock()
+		requests = append(requests, request{kind: kind, payload: payload})
+		mu.Unlock()
+		events := codexSmokeResponsesEvents("resp_http", true)
+		if service.HasCompactionTriggerInInput(payload) {
+			item := fmt.Sprintf(`{"id":"cmp_smoke","type":"compaction","encrypted_content":%q}`, compactedHistory)
+			events = codexSmokeResponsesEventsForItem("resp_compact", item)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, event := range events {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", event)
+		}
+	}))
+	defer upstream.Close()
+	gateway := newCodexSmokeGateway(t, upstream.URL, 0, service.OpenAIWSIngressModePassthrough)
+	defer gateway.Close()
+	cmd := newCodexSmokeCommand(t, binary, gateway.URL, false, "app-server", "--listen", "stdio://")
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	encoder, decoder := json.NewEncoder(stdin), json.NewDecoder(stdout)
+	var compacted bool
+	readUntil := func(predicate func(gjson.Result) bool) gjson.Result {
+		for {
+			var raw json.RawMessage
+			require.NoError(t, decoder.Decode(&raw), "waiting for app-server reply")
+			message := gjson.ParseBytes(raw)
+			if message.Get("method").String() == "item/completed" && message.Get("params.item.type").String() == "contextCompaction" {
+				compacted = true
+			}
+			if predicate(message) {
+				return message
+			}
+		}
+	}
+	call := func(id int64, method string, params map[string]any) gjson.Result {
+		require.NoError(t, encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+		message := readUntil(func(message gjson.Result) bool { return message.Get("id").Int() == id })
+		require.True(t, message.Get("result").Exists(), "%s: %s", method, message.Raw)
+		return message.Get("result")
+	}
+	awaitCompletedTurn := func() {
+		message := readUntil(func(message gjson.Result) bool { return message.Get("method").String() == "turn/completed" })
+		require.Equal(t, "completed", message.Get("params.turn.status").String(), "%s", message.Raw)
+	}
+	call(1, "initialize", map[string]any{"clientInfo": map[string]string{"name": "sub2api-loopback", "version": "1.0.0"}})
+	require.NoError(t, encoder.Encode(map[string]string{"jsonrpc": "2.0", "method": "initialized"}))
+	thread := call(2, "thread/start", map[string]any{"cwd": cmd.Dir, "ephemeral": true}).Get("thread.id").String()
+	require.NotEmpty(t, thread)
+	call(3, "turn/start", map[string]any{"threadId": thread, "input": []map[string]string{{"type": "text", "text": smokePrompt}}})
+	awaitCompletedTurn()
+	call(4, "thread/compact/start", map[string]any{"threadId": thread})
+	awaitCompletedTurn()
+	require.True(t, compacted, "app-server must report a completed context compaction item")
+	call(5, "turn/start", map[string]any{"threadId": thread, "input": []map[string]string{{"type": "text", "text": "Continue after compaction"}}})
+	awaitCompletedTurn()
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, requests, 3)
+	require.Equal(t, "turn", requests[0].kind)
+	require.Equal(t, "compaction", requests[1].kind)
+	require.True(t, gjson.GetBytes(requests[1].payload, "stream").Bool())
+	items := gjson.GetBytes(requests[1].payload, "input").Array()
+	require.NotEmpty(t, items)
+	require.Equal(t, "compaction_trigger", items[len(items)-1].Get("type").String())
+	require.Equal(t, "turn", requests[2].kind)
+	require.Equal(t, compactedHistory, gjson.GetBytes(requests[2].payload, `input.#(type=="compaction").encrypted_content`).String())
 }
 
 func TestOpenAIResponsesWebSocket_UpstreamMessageTooBigDoesNotReplay(t *testing.T) {
@@ -298,6 +405,16 @@ func newCodexSmokeGateway(t *testing.T, upstreamURL string, clientReadLimit int6
 
 func runCodexSmokeCLI(t *testing.T, binary string, baseURL string, useWS bool, prompt string) string {
 	t.Helper()
+	cmd := newCodexSmokeCommand(t, binary, baseURL, useWS, "exec", "--skip-git-repo-check", "--ephemeral", "--json", prompt)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.Output()
+	require.NoError(t, err, "CLI stderr:\n%s\nCLI stdout:\n%s", &stderr, stdout)
+	return string(stdout)
+}
+
+func newCodexSmokeCommand(t *testing.T, binary, baseURL string, useWS bool, args ...string) *exec.Cmd {
+	t.Helper()
 	dir := t.TempDir()
 	contents := fmt.Sprintf(`model = %q
 model_provider = "fixture"
@@ -310,16 +427,14 @@ env_key = "SUB2API_SMOKE_KEY"
 supports_websockets = %t
 request_max_retries = 0
 stream_max_retries = 1
+[model_providers.fixture.capabilities]
+remote_compaction = "v2"
 `, smokeModel, baseURL+"/v1", useWS)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.toml"), []byte(contents), 0600))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, "exec", "--skip-git-repo-check", "--ephemeral", "--json", prompt)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = dir
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + dir, "SUB2API_SMOKE_KEY=" + smokeClient}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	stdout, err := cmd.Output()
-	require.NoError(t, err, "CLI stderr:\n%s\nCLI stdout:\n%s", &stderr, stdout)
-	return string(stdout)
+	return cmd
 }

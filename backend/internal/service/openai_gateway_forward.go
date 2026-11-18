@@ -18,6 +18,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// Codex can carry its base instructions entirely in developer input messages.
+func codexInputCarriesInstructions(body []byte) bool {
+	found := false
+	gjson.GetBytes(body, "input").ForEach(func(_, item gjson.Result) bool {
+		if item.Get("role").String() == "developer" && item.Get("type").String() == "message" {
+			item.Get("content").ForEach(func(_, part gjson.Result) bool {
+				found = part.Get("type").String() == "input_text" && strings.TrimSpace(part.Get("text").String()) != ""
+				return !found
+			})
+		}
+		return !found
+	})
+	return found
+}
+
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
 	beginUpstreamResponseModelObservation(c)
@@ -411,7 +426,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	instructions := gjson.GetBytes(body, "instructions")
 	instructionsEmpty := !instructions.Exists() || instructions.Type != gjson.String || strings.TrimSpace(instructions.String()) == ""
-	if instructionsEmpty && account.UsesOpenAICodexProtocol() && !compatMessagesBridge && !nativeCNResponses {
+	keepInstructionsOmitted := account.UsesOpenAICodexProtocol() && isCodexCLI && !instructions.Exists() && codexInputCarriesInstructions(body)
+	if instructionsEmpty && !keepInstructionsOmitted && account.UsesOpenAICodexProtocol() && !compatMessagesBridge && !nativeCNResponses {
 		markPatchSet("instructions", defaultCodexSynthInstructions(upstreamModel))
 	}
 	if billingModel != requestedModel {
@@ -547,6 +563,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			codexResult = applyCodexOAuthTransformWithOptions(decoded, codexOAuthTransformOptions{
 				IsCodexCLI:                          isCodexCLI,
 				IsCompact:                           isCompactRequest,
+				SkipDefaultInstructions:             keepInstructionsOmitted,
+				PreserveUserMessageIDs:              !isCompactRequest && GetOpenAIClientTransport(c) == OpenAIClientTransportHTTP,
 				OmitPromotedSystemMessagesFromInput: omitPromotedSystemMessages,
 				ResponsesLite:                       responsesLite,
 			})

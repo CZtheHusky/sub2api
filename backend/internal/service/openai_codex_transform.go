@@ -100,6 +100,7 @@ type codexOAuthTransformOptions struct {
 	IsCompact                           bool
 	SkipDefaultInstructions             bool
 	PreserveToolCallIDs                 bool
+	PreserveUserMessageIDs              bool
 	OmitPromotedSystemMessagesFromInput bool
 	// ResponsesLite selects where an injected hosted tool is declared.
 	ResponsesLite bool
@@ -334,8 +335,9 @@ func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuth
 			result.Modified = true
 		}
 		input = filterCodexInputWithOptions(input, codexInputFilterOptions{
-			PreserveReferences: needsToolContinuation,
-			PreserveCallIDs:    opts.PreserveToolCallIDs,
+			PreserveReferences:     needsToolContinuation,
+			PreserveCallIDs:        opts.PreserveToolCallIDs,
+			PreserveUserMessageIDs: opts.PreserveUserMessageIDs,
 		})
 		reqBody["input"] = input
 		result.Modified = true
@@ -1535,8 +1537,9 @@ func isInstructionsEmpty(reqBody map[string]any) bool {
 }
 
 type codexInputFilterOptions struct {
-	PreserveReferences bool
-	PreserveCallIDs    bool
+	PreserveReferences     bool
+	PreserveCallIDs        bool
+	PreserveUserMessageIDs bool
 }
 
 // filterCodexInput 按需过滤 item_reference 与 id。
@@ -1839,12 +1842,17 @@ func filterCodexInputWithOptions(input []any, opts codexInputFilterOptions) []an
 					newItem["id"] = normalizedID
 				}
 			}
-		} else if !opts.PreserveReferences {
-			ensureCopy()
-			delete(newItem, "id")
-		} else if id, ok := m["id"].(string); ok && shouldStripOpenAIResponsesInputItemID(typ, id) {
-			ensureCopy()
-			delete(newItem, "id")
+		} else {
+			id, hasID := m["id"].(string)
+			role, _ := m["role"].(string)
+			// A user message keeps its identity if the client resends this
+			// request over HTTP after a WebSocket rejection.
+			userMessageID := opts.PreserveUserMessageIDs && typ == "message" && role == "user" &&
+				len(id) > len("msg_") && strings.HasPrefix(id, "msg_")
+			if (!opts.PreserveReferences && !userMessageID) || (hasID && shouldStripOpenAIResponsesInputItemID(typ, id)) {
+				ensureCopy()
+				delete(newItem, "id")
+			}
 		}
 
 		filtered = append(filtered, newItem)
