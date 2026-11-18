@@ -9995,7 +9995,7 @@ const form = reactive<SettingsForm>({
   openai_codex_client_version: "",
   // 只读展示：自动同步任务写入的官方最新稳定版，不参与提交（提交载荷按字段显式构造）
   openai_codex_client_version_synced: "",
-  openai_codex_version_auto_sync_enabled: true,
+  openai_codex_version_auto_sync_enabled: false,
   claude_code_client_version: "",
   // 只读展示：自动同步任务写入的官方最新稳定版，不参与提交（提交载荷按字段显式构造）
   claude_code_client_version_synced: "",

@@ -248,9 +248,9 @@ type SystemSettings struct {
 	RewriteMessageCacheControl             bool   // 是否改写 messages[*].content[*].cache_control（默认 false）
 	AntigravityUserAgentVersion            string // Antigravity 上游 User-Agent 版本号；空值使用配置/默认值
 	OpenAICodexUserAgent                   string // OpenAI Codex 上游完整 User-Agent；空值由 Codex 客户端版本号拼出标准 CLI UA
-	OpenAICodexClientVersion               string // 出站声明的 Codex 客户端版本号（管理员覆写）；空值跟随自动同步值
+	OpenAICodexClientVersion               string // 出站声明的 Codex 客户端版本号（管理员覆写）；空值走版本选择规则
 	OpenAICodexClientVersionSynced         string // 自动同步到的官方最新稳定版版本号（只读展示）
-	OpenAICodexVersionAutoSyncEnabled      bool   // 是否启用 Codex 客户端版本号自动同步（默认 true）
+	OpenAICodexVersionAutoSyncEnabled      bool   // 是否启用 Codex 客户端版本号自动同步（默认 false）
 	ClaudeCodeClientVersion                string // 出站声明的 Claude Code CLI 客户端版本号（管理员覆写）；空值跟随自动同步值
 	ClaudeCodeClientVersionSynced          string // 自动同步到的官方最新版本号（只读展示）
 	ClaudeCodeVersionAutoSyncEnabled       bool   // 是否启用 Claude Code 客户端版本号自动同步（默认 true）

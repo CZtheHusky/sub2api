@@ -176,17 +176,10 @@ func (s *OpenAICodexVersionSyncService) fetchLatestStableVersion(ctx context.Con
 	return version
 }
 
-// autoSyncEnabled 读取面板开关。缺失或空值视为开启，与设置默认值一致；
-// 读取失败时保持开启，避免一次数据库抖动就静默停掉版本跟随。
+// autoSyncEnabled 仅在管理员明确开启时同步。读取失败时保留固定版本。
 func (s *OpenAICodexVersionSyncService) autoSyncEnabled(ctx context.Context) bool {
 	value, err := s.settingRepo.GetValue(ctx, SettingKeyOpenAICodexVersionAutoSyncEnabled)
-	if err != nil {
-		return true
-	}
-	if strings.TrimSpace(value) == "" {
-		return true
-	}
-	return strings.TrimSpace(value) == "true"
+	return err == nil && strings.TrimSpace(value) == "true"
 }
 
 func (s *OpenAICodexVersionSyncService) currentSyncedVersion(ctx context.Context) string {

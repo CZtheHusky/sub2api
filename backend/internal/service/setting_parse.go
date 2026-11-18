@@ -246,7 +246,7 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		SettingKeyOpenAICodexUserAgent:                               "",
 		SettingKeyOpenAICodexClientVersion:                           "",
 		SettingKeyOpenAICodexClientVersionSynced:                     "",
-		SettingKeyOpenAICodexVersionAutoSyncEnabled:                  "true",
+		SettingKeyOpenAICodexVersionAutoSyncEnabled:                  "false",
 		SettingKeyClaudeCodeClientVersion:                            "",
 		SettingKeyClaudeCodeClientVersionSynced:                      "",
 		SettingKeyClaudeCodeVersionAutoSyncEnabled:                   "true",
@@ -890,15 +890,10 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	result.OpenAICodexUserAgent = strings.TrimSpace(settings[SettingKeyOpenAICodexUserAgent])
 	result.OpenAICodexClientVersion = NormalizeCodexClientVersion(settings[SettingKeyOpenAICodexClientVersion])
 	result.OpenAICodexClientVersionSynced = NormalizeCodexClientVersion(settings[SettingKeyOpenAICodexClientVersionSynced])
-	// 自动同步默认开启：缺失/空值一律视为开启，与 enable_client_dateline_normalization 同一惯例。
-	if v, ok := settings[SettingKeyOpenAICodexVersionAutoSyncEnabled]; ok && v != "" {
-		result.OpenAICodexVersionAutoSyncEnabled = v == "true"
-	} else {
-		result.OpenAICodexVersionAutoSyncEnabled = true
-	}
+	result.OpenAICodexVersionAutoSyncEnabled = strings.TrimSpace(settings[SettingKeyOpenAICodexVersionAutoSyncEnabled]) == "true"
 	result.ClaudeCodeClientVersion = NormalizeClaudeCodeClientVersion(settings[SettingKeyClaudeCodeClientVersion])
 	result.ClaudeCodeClientVersionSynced = NormalizeClaudeCodeClientVersion(settings[SettingKeyClaudeCodeClientVersionSynced])
-	// 自动同步默认开启：缺失/空值一律视为开启，与 openai_codex_version_auto_sync_enabled 同一惯例。
+	// Claude Code 版本自动同步默认开启。
 	if v, ok := settings[SettingKeyClaudeCodeVersionAutoSyncEnabled]; ok && v != "" {
 		result.ClaudeCodeVersionAutoSyncEnabled = v == "true"
 	} else {

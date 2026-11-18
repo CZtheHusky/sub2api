@@ -699,14 +699,13 @@ const (
 	// 用于避免 Cloudflare 对浏览器型 UA 的质询拦截。
 	SettingKeyOpenAICodexUserAgent = "openai_codex_user_agent"
 	// SettingKeyOpenAICodexClientVersion 网关对 ChatGPT 上游声明的 Codex 客户端版本号（管理员覆写）。
-	// 空值表示跟随自动同步值；自动同步也没有结果时回退到内置常量。
-	// 上游在容量紧张时按客户端身份分优先级降载，陈旧版本会被优先丢弃，故该值需保持跟随官方发布。
+	// 空值时使用已启用的同步值，否则使用内置对齐版本。
 	SettingKeyOpenAICodexClientVersion = "openai_codex_client_version"
 	// SettingKeyOpenAICodexClientVersionSynced 自动同步任务写入的官方 Codex 最新稳定版版本号。
 	// 由 OpenAICodexVersionSyncService 独占写入，面板只读展示；管理员覆写请用
 	// SettingKeyOpenAICodexClientVersion。
 	SettingKeyOpenAICodexClientVersionSynced = "openai_codex_client_version_synced"
-	// SettingKeyOpenAICodexVersionAutoSyncEnabled 是否启用 Codex 客户端版本号自动同步（默认 true）。
+	// SettingKeyOpenAICodexVersionAutoSyncEnabled 是否启用 Codex 客户端版本号自动同步（默认 false）。
 	SettingKeyOpenAICodexVersionAutoSyncEnabled = "openai_codex_version_auto_sync_enabled"
 	// SettingKeyClaudeCodeClientVersion 网关对 Anthropic 上游声明的 Claude Code CLI 客户端版本号（管理员覆写）。
 	// 空值表示跟随自动同步值；自动同步也没有结果时回退到 claude.CLIVersion()（环境变量覆盖 + 内置基线）。

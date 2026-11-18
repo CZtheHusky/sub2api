@@ -338,9 +338,7 @@ func (s *SettingService) GetOpenAICodexUserAgent(ctx context.Context) string {
 }
 
 // GetOpenAICodexClientVersion 返回出站声明的 Codex 客户端版本号。
-// 优先级：管理员在面板覆写的版本 → 自动同步到的官方最新稳定版 → 内置常量。
-// 上游会按客户端身份进行风控分层，陈旧版本可能被优先丢弃，故该值需保持跟随官方发布；
-// 自动同步让运维不必为了跟版本而发新版本。
+// 优先使用管理员覆写；仅开启自动同步时使用同步值，其余情况使用内置对齐版本。
 func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string {
 	fallback := codexCLIVersion
 	if s == nil || s.settingRepo == nil {
@@ -366,6 +364,7 @@ func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string
 		values, err := s.settingRepo.GetMultiple(dbCtx, []string{
 			SettingKeyOpenAICodexClientVersion,
 			SettingKeyOpenAICodexClientVersionSynced,
+			SettingKeyOpenAICodexVersionAutoSyncEnabled,
 		})
 		if err != nil {
 			slog.Warn("failed to get openai codex client version setting", "error", err)
@@ -376,7 +375,7 @@ func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string
 			return fallback, nil
 		}
 		version := NormalizeCodexClientVersion(values[SettingKeyOpenAICodexClientVersion])
-		if version == "" {
+		if version == "" && strings.TrimSpace(values[SettingKeyOpenAICodexVersionAutoSyncEnabled]) == "true" {
 			version = NormalizeCodexClientVersion(values[SettingKeyOpenAICodexClientVersionSynced])
 		}
 		if version == "" {
