@@ -271,25 +271,7 @@ func TestOpenAIWSOAuthCtxPoolInterruptBackpressureRetainsTerminalUsage(t *testin
 		}}
 	})
 	defer server.Close()
-	dialer := &net.Dialer{}
-	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-		conn, err := dialer.DialContext(ctx, network, address)
-		if err != nil {
-			return nil, err
-		}
-		if err := conn.(*net.TCPConn).SetReadBuffer(4096); err != nil {
-			_ = conn.Close()
-			return nil, err
-		}
-		return conn, nil
-	}}
-	defer transport.CloseIdleConnections()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &coderws.DialOptions{
-		HTTPClient: &http.Client{Transport: transport},
-	})
-	require.NoError(t, err)
+	client := dialInterruptSlowReader(t, server, 4096)
 	defer func() { _ = client.CloseNow() }()
 	writeInterruptTestClient(t, client, `{"type":"response.create","model":"gpt-5.1","stream":true}`)
 	requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
@@ -316,6 +298,77 @@ func TestOpenAIWSOAuthCtxPoolInterruptBackpressureRetainsTerminalUsage(t *testin
 	result := <-billed
 	require.Equal(t, 11, result.Usage.InputTokens)
 	require.Equal(t, 2, result.Usage.OutputTokens)
+}
+
+func TestOpenAIWSOAuthCtxPoolInterruptDrainAllowsSlowDownstream(t *testing.T) {
+	upstream := &interruptTestConn{newStagedPassthroughConn()}
+	svc, account, dialer := newInterruptTestService(t, upstream)
+	svc.cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 5
+	server, done := startPassthroughLifecycleServer(t, context.Background(), svc, account)
+	defer server.Close()
+	client := dialInterruptSlowReader(t, server, 128<<10)
+	defer func() { _ = client.CloseNow() }()
+	client.SetReadLimit(16 << 20)
+	writeInterruptTestClient(t, client, interruptDrainTestCreate)
+	requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+	upstream.Send(interruptTestCreated)
+	requireInterruptDownstream(t, client, interruptTestCreated)
+	writeInterruptTestClient(t, client, interruptTestControl)
+	require.JSONEq(t, interruptTestControl, string(requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)))
+
+	// A steering client may take more than one second to read a terminal
+	// before it knows which response ID to continue.
+	terminal := strings.TrimSuffix(interruptTestComplete, "}") + `,"padding":"` + strings.Repeat("x", 8<<20) + `"}`
+	upstream.Send(terminal)
+	select {
+	case <-upstream.closed:
+		t.Fatal("the gateway applied the cancellation deadline to a Lite steering write")
+	case <-time.After(openAIWSInterruptTimeout + 350*time.Millisecond):
+	}
+	payload, err := readPassthroughLifecycleFrame(t, client, 3*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, len(terminal), len(payload))
+	require.Equal(t, "resp_active", gjson.GetBytes(payload, "response.id").String())
+
+	writeInterruptTestClient(t, client, interruptDrainTestContinuation)
+	create := requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+	require.Equal(t, "resp_active", gjson.GetBytes(create, "previous_response_id").String())
+	require.Equal(t, 1, dialer.DialCount(), "steering must reuse the lease after the slow terminal write")
+	upstream.Send(interruptTestAck)
+	const nextComplete = `{"type":"response.completed","response":{"id":"resp_next","status":"completed"}}`
+	upstream.Send(nextComplete)
+	requireInterruptDownstream(t, client, nextComplete)
+	require.NoError(t, client.Close(coderws.StatusNormalClosure, ""))
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("client close did not finish the steered session")
+	}
+}
+
+func dialInterruptSlowReader(t *testing.T, server *httptest.Server, readBuffer int) *coderws.Conn {
+	t.Helper()
+	dialer := &net.Dialer{}
+	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		if err := conn.(*net.TCPConn).SetReadBuffer(readBuffer); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}}
+	t.Cleanup(transport.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &coderws.DialOptions{
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	require.NoError(t, err)
+	return client
 }
 
 func TestOpenAIWSOAuthCtxPoolInterruptMissingAckDiscardsLease(t *testing.T) {

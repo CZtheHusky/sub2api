@@ -166,3 +166,57 @@ func TestOpenAIWSOAuthCtxPoolInterruptDrainRejectsUnrelatedCreateWithoutAck(t *t
 		})
 	}
 }
+
+func TestOpenAIWSOAuthCtxPoolInterruptContinuationGetsFreshReadTimeout(t *testing.T) {
+	for _, supplyTerminal := range []bool{true, false} {
+		name := "missing first frame times out"
+		if supplyTerminal {
+			name = "first frame within new turn budget"
+		}
+		t.Run(name, func(t *testing.T) {
+			upstream := &interruptTestConn{newStagedPassthroughConn()}
+			svc, account, _ := newInterruptTestService(t, upstream)
+			svc.cfg.Gateway.OpenAIWS.ReadTimeoutSeconds = 1
+			server, done := startPassthroughLifecycleServer(t, context.Background(), svc, account)
+			defer server.Close()
+			client := dialPassthroughLifecycleClientWithPayload(t, server, interruptDrainTestCreate)
+			defer client.CloseNow()
+			requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+			upstream.Send(interruptTestCreated)
+			requireInterruptDownstream(t, client, interruptTestCreated)
+			writeInterruptTestClient(t, client, interruptTestControl)
+			requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+			upstream.Send(interruptTestComplete)
+			requireInterruptDownstream(t, client, interruptTestComplete)
+
+			// Spend part of the old read budget before the next create.
+			time.Sleep(650 * time.Millisecond)
+			writeInterruptTestClient(t, client, interruptDrainTestContinuation)
+			requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, time.Second)
+			select {
+			case <-upstream.closed:
+				t.Fatal("the old ACK read deadline cut short the continuation")
+			case <-time.After(650 * time.Millisecond):
+			}
+			if supplyTerminal {
+				const next = `{"type":"response.completed","response":{"id":"resp_next","status":"completed"}}`
+				upstream.Send(next)
+				requireInterruptDownstream(t, client, next)
+				return
+			}
+			// The handoff also has to retain the ordinary first-frame timeout.
+			select {
+			case <-upstream.closed:
+			case <-time.After(time.Second):
+				t.Fatal("continuation with no upstream frame did not time out")
+			}
+			_ = client.CloseNow()
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+			case <-time.After(2 * time.Second):
+				t.Fatal("gateway did not finish the timed out turn")
+			}
+		})
+	}
+}

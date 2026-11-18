@@ -11,21 +11,24 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestOpenAIWSOAuthCtxPoolInterruptTerminalTiming(t *testing.T) {
+func TestOpenAIWSOAuthCtxPoolInterruptTerminalNotifications(t *testing.T) {
 	const (
 		interrupted = `{"type":"response.incomplete","response":{"id":"resp_active","status":"incomplete","incomplete_details":{"reason":"interrupted"},"usage":{"input_tokens":11,"output_tokens":2}}}`
+		metadata    = `{"type":"response.metadata","response_id":"resp_active","headers":{"x-codex-turn-state":"fixture-turn-state"}}`
 		timing      = `{"type":"responsesapi.websocket_timing","response_id":"resp_active","timing":{"total_ms":73}}`
 		nextCreate  = `{"type":"response.create","model":"gpt-5.1","stream":true,"input":[{"role":"user","content":"next turn"}]}`
 		nextDone    = `{"type":"response.completed","response":{"id":"resp_next","status":"completed"}}`
 	)
+	notifications := []string{metadata, timing}
 	for _, tc := range []struct {
 		name     string
 		terminal string
 		ack      bool
 	}{
-		{name: "completed then timing then ACK", terminal: interruptTestComplete, ack: true},
-		{name: "interrupted then timing then ACK", terminal: interrupted, ack: true},
-		{name: "interrupted then timing without ACK", terminal: interrupted},
+		{name: "completed then notifications then ACK", terminal: interruptTestComplete, ack: true},
+		{name: "interrupted then notifications then ACK", terminal: interrupted, ack: true},
+		{name: "completed then notifications without ACK", terminal: interruptTestComplete},
+		{name: "interrupted then notifications without ACK", terminal: interrupted},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := &interruptTestConn{newStagedPassthroughConn()}
@@ -51,8 +54,10 @@ func TestOpenAIWSOAuthCtxPoolInterruptTerminalTiming(t *testing.T) {
 
 			upstream.Send(tc.terminal)
 			requireInterruptDownstream(t, client, tc.terminal)
-			upstream.Send(timing)
-			requireInterruptDownstream(t, client, timing)
+			for _, notification := range notifications {
+				upstream.Send(notification)
+				requireInterruptDownstream(t, client, notification)
+			}
 
 			// A queued turn must be held behind the cancellation acknowledgement.
 			writeInterruptTestClient(t, client, nextCreate)
@@ -67,7 +72,7 @@ func TestOpenAIWSOAuthCtxPoolInterruptTerminalTiming(t *testing.T) {
 				require.NoError(t, client.Close(coderws.StatusNormalClosure, ""))
 			} else {
 				// If notifications restarted the wait, the lease would stay open
-				// past the deadline while timing frames keep arriving.
+				// past the deadline while metadata and timing frames keep arriving.
 				ticker := time.NewTicker(200 * time.Millisecond)
 				defer ticker.Stop()
 				deadline := time.After(time.Until(started.Add(2 * openAIWSInterruptTimeout)))
@@ -75,14 +80,16 @@ func TestOpenAIWSOAuthCtxPoolInterruptTerminalTiming(t *testing.T) {
 				for {
 					select {
 					case <-ticker.C:
-						select {
-						case upstream.frames <- stagedPassthroughFrame{messageType: coderws.MessageText, payload: []byte(timing)}:
-						default:
+						for _, notification := range notifications {
+							select {
+							case upstream.frames <- stagedPassthroughFrame{messageType: coderws.MessageText, payload: []byte(notification)}:
+							default:
+							}
 						}
 					case <-upstream.closed:
 						break waitForTimeout
 					case <-deadline:
-						t.Fatal("timing notifications extended the interrupt deadline")
+						t.Fatal("notifications extended the interrupt deadline")
 					}
 				}
 				require.GreaterOrEqual(t, time.Since(started), 750*time.Millisecond)

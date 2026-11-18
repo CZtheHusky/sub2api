@@ -55,6 +55,7 @@ var errOpenAIWSDrainContinued = errors.New("client continued the drained respons
 
 type openAIWSInterruptTurn struct {
 	liteTurnID     string
+	liteRejected   bool
 	terminalSeen   bool
 	responseID     string
 	awaitingAck    bool
@@ -127,6 +128,9 @@ func (r *openAIWSIngressInterrupt) releaseLease(lease *openAIWSConnLease) {
 		r.drainedLease = nil
 	}
 	if pending := r.pending; pending != nil && pending.lease == lease {
+		// The handoff read may already have removed a frame. An early
+		// release cannot hand this socket to another pool borrower.
+		lease.abort()
 		pending.cancel()
 		<-pending.result
 		r.pending = nil
@@ -138,14 +142,24 @@ func (r *openAIWSIngressInterrupt) readFirst(lease *openAIWSConnLease, timeout t
 		read := r.pending
 		r.pending = nil
 		defer read.cancel()
-		result := <-read.result
-		return result.payload, result.err
+		// The old ACK read stays in flight so a frame cannot be lost. Its
+		// next-turn budget starts here, after the new create was written.
+		ctx, cancel := context.WithTimeout(r.ctx, timeout)
+		defer cancel()
+		select {
+		case result := <-read.result:
+			return result.payload, result.err
+		case <-ctx.Done():
+			read.cancel()
+			<-read.result
+			return nil, ctx.Err()
+		}
 	}
 	return lease.ReadMessageWithContextTimeout(r.ctx, timeout)
 }
 
 func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *openAIWSInterruptTurn, readTimeout, writeTimeout time.Duration, writeClient func([]byte) error) ([]byte, error) {
-	deadline, deadlineErr := r.readDeadline(turn)
+	deadline, deadlineErr := r.interruptDeadline(turn)
 	if !deadline.IsZero() && !time.Now().Before(deadline) {
 		return nil, deadlineErr
 	}
@@ -158,8 +172,18 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 		}
 	}()
 	upstream := make(chan openAIWSClientReadResult, 1)
+	// A post-terminal Lite read may be handed to the next turn. Bound the
+	// current wait independently of the socket read so handoff preserves it.
+	socketTimeout := readTimeout
+	var ackReadTimeout <-chan time.Time
+	if turn.terminalSeen && turn.liteTurnID != "" && readTimeout > 0 {
+		socketTimeout = 0
+		timer := time.NewTimer(readTimeout)
+		defer timer.Stop()
+		ackReadTimeout = timer.C
+	}
 	go func() {
-		body, err := lease.ReadMessageWithContextTimeout(readCtx, readTimeout)
+		body, err := lease.ReadMessageWithContextTimeout(readCtx, socketTimeout)
 		upstream <- openAIWSClientReadResult{payload: body, err: err}
 	}()
 	var timer *time.Timer
@@ -170,7 +194,7 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 	}()
 	var timedOut <-chan time.Time
 	resetDeadline := func() {
-		deadline, deadlineErr = r.readDeadline(turn)
+		deadline, deadlineErr = r.interruptDeadline(turn)
 		if !deadline.IsZero() {
 			if timer != nil {
 				timer.Stop()
@@ -189,18 +213,25 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 		if turn.terminalSeen && turn.continues(r.queued) {
 			keepRead = true
 			r.pending = &openAIWSInterruptRead{lease: lease, result: upstream, cancel: cancel}
-			r.drainedLease = lease
-			if r.drainedIDs == nil {
-				r.drainedIDs = make(map[string]bool)
+			if turn.awaitingAck {
+				r.drainedLease = lease
+				if r.drainedIDs == nil {
+					r.drainedIDs = make(map[string]bool)
+				}
+				r.drainedIDs[turn.responseID] = true
 			}
-			r.drainedIDs[turn.responseID] = true
 			return nil, errOpenAIWSDrainContinued
+		}
+		if turn.liteRejected && r.queued != nil && !turn.continues(r.queued) {
+			return endRead(errOpenAIWSInterruptRejected)
 		}
 		select {
 		case result := <-upstream:
 			return result.payload, result.err
 		case <-timedOut:
 			return endRead(deadlineErr)
+		case <-ackReadTimeout:
+			return endRead(context.DeadlineExceeded)
 		case result := <-r.reading:
 			r.reading = nil
 			if !r.drainDeadline.IsZero() {
@@ -211,6 +242,9 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 					return endRead(result.err)
 				}
 				r.queued = &result
+				if turn.liteRejected {
+					return endRead(errOpenAIWSInterruptRejected)
+				}
 				if turn.liteTurnID != "" && !turn.cancelDeadline.IsZero() {
 					return endRead(context.Canceled)
 				}
@@ -285,7 +319,7 @@ func openAIWSHasDuplicateMessageType(payload []byte) bool {
 	return count > 1
 }
 
-func (r *openAIWSIngressInterrupt) readDeadline(turn *openAIWSInterruptTurn) (time.Time, error) {
+func (r *openAIWSIngressInterrupt) interruptDeadline(turn *openAIWSInterruptTurn) (time.Time, error) {
 	if !r.drainDeadline.IsZero() {
 		if !turn.cancelDeadline.IsZero() && turn.cancelDeadline.Before(r.drainDeadline) {
 			return turn.cancelDeadline, context.Canceled
@@ -317,6 +351,7 @@ func (t *openAIWSInterruptTurn) recordAck(kind string, payload []byte) error {
 		return errors.New("unexpected upstream websocket interruption acknowledgement")
 	}
 	t.awaitingAck = false
+	t.liteRejected = kind == openAIWSInterruptFailed && t.liteTurnID != ""
 	return nil
 }
 
@@ -326,6 +361,7 @@ func (r *openAIWSIngressInterrupt) finishTurn(lease *openAIWSConnLease, turn *op
 		payload, err := r.readUpstream(lease, turn, readTimeout, writeTimeout, writeClient)
 		if errors.Is(err, errOpenAIWSDrainContinued) {
 			turn.awaitingAck = false
+			turn.liteRejected = false
 			return nil
 		}
 		if err != nil {
@@ -347,10 +383,15 @@ func (r *openAIWSIngressInterrupt) finishTurn(lease *openAIWSConnLease, turn *op
 				return err
 			}
 			if kind == openAIWSInterruptFailed {
+				if turn.liteRejected {
+					// Cancel closes the socket after rejection. Drain may
+					// continue the same logical turn on this connection.
+					continue
+				}
 				return errOpenAIWSInterruptRejected
 			}
 			return nil
-		case "codex.response.metadata", "codex.rate_limits", "responsesapi.websocket_timing":
+		case "response.metadata", "codex.response.metadata", "codex.rate_limits", "responsesapi.websocket_timing":
 			if err := writeClient(payload); err != nil {
 				return err
 			}

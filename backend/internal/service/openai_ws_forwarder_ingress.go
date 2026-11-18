@@ -1021,20 +1021,17 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if interruptTurn.cancelDeadline.IsZero() {
 				return writeClientMessage(message)
 			}
-			if interruptTurn.liteTurnID != "" {
-				err := writeClientWithTimeout(message, min(openAIWSInterruptTimeout, s.openAIWSWriteTimeout()))
-				if errors.Is(err, context.DeadlineExceeded) {
-					return errOpenAIWSInterruptTimeout
-				}
-				return err
+			deadline, deadlineErr := interruptReader.interruptDeadline(&interruptTurn)
+			if deadline.IsZero() {
+				return writeClientMessage(message)
 			}
-			remaining := time.Until(interruptTurn.cancelDeadline)
+			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				return errOpenAIWSInterruptTimeout
+				return deadlineErr
 			}
 			err := writeClientWithTimeout(message, min(remaining, s.openAIWSWriteTimeout()))
-			if err != nil && !time.Now().Before(interruptTurn.cancelDeadline) {
-				return errOpenAIWSInterruptTimeout
+			if err != nil && !time.Now().Before(deadline) {
+				return deadlineErr
 			}
 			return err
 		}
@@ -1306,21 +1303,25 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					markOpenAIWSClientVisibleFailure(c, eventType, upstreamMessage)
 				}
 			}
-			if interruptReader != nil && eventType == openAIWSInterruptFailed {
+			if interruptReader != nil && eventType == openAIWSInterruptFailed && !interruptTurn.liteRejected {
 				lease.abort()
 				return nil, errOpenAIWSInterruptRejected
 			}
 			if isTerminalEvent {
-				if interruptionErr == nil && interruptTurn.awaitingAck {
+				if interruptionErr == nil && (interruptTurn.awaitingAck || interruptTurn.liteRejected) {
 					terminalCompletesInterrupt := eventType == "response.completed" || eventType == "response.done" ||
 						(eventType == "response.incomplete" && gjson.GetBytes(upstreamMessage, "response.incomplete_details.reason").String() == "interrupted")
 					if !clientDisconnected && terminalCompletesInterrupt {
 						interruptionErr = interruptReader.finishTurn(lease, &interruptTurn, s.openAIWSReadTimeout(), s.openAIWSWriteTimeout(), writeTurnMessage)
 					}
-					if interruptTurn.awaitingAck || interruptionErr != nil {
+					if interruptTurn.awaitingAck || interruptTurn.liteRejected || interruptionErr != nil {
 						lease.abort()
 						if interruptionErr == nil && !clientDisconnected {
-							interruptionErr = errors.New("upstream websocket ended before interruption acknowledgement")
+							if interruptTurn.liteRejected {
+								interruptionErr = errOpenAIWSInterruptRejected
+							} else {
+								interruptionErr = errors.New("upstream websocket ended before interruption acknowledgement")
+							}
 						}
 					}
 				}

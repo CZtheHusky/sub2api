@@ -24,7 +24,26 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const (
+	codexCLI170CancelTerminal = `{"type":"response.completed","response":{"id":"resp_generated","object":"response","created_at":1,"model":"gpt-6.1-sol","status":"completed","output":[],"usage":{"input_tokens":11,"output_tokens":2,"total_tokens":13}}}`
+	codexCLI170Reject         = `{"type":"response.interrupt.failed","response_id":"resp_generated"}`
+)
+
 func TestCodexCLI170OAuthCtxPoolSteering(t *testing.T) {
+	testCodexCLI170OAuthCtxPoolSteering(t, false, false)
+}
+
+func TestCodexCLI170OAuthCtxPoolSteeringAfterRejection(t *testing.T) {
+	t.Run("rejection before terminal", func(t *testing.T) {
+		testCodexCLI170OAuthCtxPoolSteering(t, true, false)
+	})
+	t.Run("rejection after terminal", func(t *testing.T) {
+		testCodexCLI170OAuthCtxPoolSteering(t, false, true)
+	})
+}
+
+func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, rejectBeforeTerminal, rejectAfterTerminal bool) {
+	t.Helper()
 	binary := requireCodexCLI170ResponsesLiteBinary(t)
 	server, upstream, dialer, results, proxyDone := startCodexCLI170OAuthCtxPoolSmokeGateway(t)
 	app := startCodexCLI170ResponsesLiteAppServer(t, binary, server.URL)
@@ -41,7 +60,9 @@ func TestCodexCLI170OAuthCtxPoolSteering(t *testing.T) {
 	require.JSONEq(t, `{"type":"response.interrupt","response_id":"resp_generated","mode":"discard_partial_items"}`, string(control))
 
 	// A steering Drain waits for a terminal under the normal stream deadline.
-	// Keep the response open past the CLI cancellation window and omit the ACK.
+	if rejectBeforeTerminal {
+		upstream.Send(codexCLI170Reject)
+	}
 	select {
 	case <-upstream.closed:
 		t.Fatal("steering must preserve the current upstream connection while draining")
@@ -49,6 +70,9 @@ func TestCodexCLI170OAuthCtxPoolSteering(t *testing.T) {
 	}
 	for _, event := range firstEvents[3:] {
 		upstream.Send(event)
+	}
+	if rejectAfterTerminal {
+		upstream.Send(codexCLI170Reject)
 	}
 
 	followUp := requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, 5*time.Second)
@@ -92,8 +116,7 @@ func TestCodexCLI170OAuthCtxPoolSteering(t *testing.T) {
 }
 
 func TestCodexCLI170OAuthCtxPoolCancelWithoutAck(t *testing.T) {
-	const terminal = `{"type":"response.completed","response":{"id":"resp_generated","object":"response","created_at":1,"model":"gpt-6.1-sol","status":"completed","output":[],"usage":{"input_tokens":11,"output_tokens":2,"total_tokens":13}}}`
-	testCodexCLI170OAuthCtxPoolCancelDeadline(t, terminal, true)
+	testCodexCLI170OAuthCtxPoolCancelDeadline(t, codexCLI170CancelTerminal, true)
 }
 
 func TestCodexCLI170OAuthCtxPoolCancelWithoutTerminal(t *testing.T) {
@@ -128,7 +151,48 @@ func testCodexCLI170OAuthCtxPoolCancelDeadline(t *testing.T, upstreamEvent strin
 	default:
 		t.Fatal("the CLI abandoned the socket but the gateway left the upstream connection open")
 	}
+	requireCodexCLI170CancelResult(t, app, results, gotTerminal, context.Canceled)
+}
 
+func TestCodexCLI170OAuthCtxPoolCancelRejected(t *testing.T) {
+	for _, terminalFirst := range []bool{false, true} {
+		name := "rejection before terminal"
+		if terminalFirst {
+			name = "rejection after terminal"
+		}
+		t.Run(name, func(t *testing.T) {
+			binary := requireCodexCLI170ResponsesLiteBinary(t)
+			server, upstream, _, results, proxyDone := startCodexCLI170OAuthCtxPoolSmokeGateway(t)
+			app := startCodexCLI170ResponsesLiteAppServer(t, binary, server.URL)
+			startCodexCLI170ResponsesLiteGeneration(t, app, upstream)
+
+			app.send(4, "turn/interrupt", map[string]any{"threadId": app.thread, "turnId": app.turn})
+			control := requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, 5*time.Second)
+			require.JSONEq(t, `{"type":"response.interrupt","response_id":"resp_generated","mode":"discard_partial_items"}`, string(control))
+			if terminalFirst {
+				upstream.Send(codexCLI170CancelTerminal)
+			}
+			upstream.Send(codexCLI170Reject)
+			// An explicit rejection should make the live CLI retire its
+			// socket before its one-second cancellation deadline.
+			select {
+			case err := <-proxyDone:
+				require.ErrorIs(t, err, errOpenAIWSInterruptRejected)
+			case <-time.After(800 * time.Millisecond):
+				t.Fatal("the CLI did not abandon the rejected cancellation promptly")
+			}
+			select {
+			case <-upstream.closed:
+			default:
+				t.Fatal("the rejected cancellation retained the upstream lease")
+			}
+			requireCodexCLI170CancelResult(t, app, results, terminalFirst, errOpenAIWSInterruptRejected)
+		})
+	}
+}
+
+func requireCodexCLI170CancelResult(t *testing.T, app codexCLI170ResponsesLiteAppServer, results <-chan codexCLI170TurnOutcome, gotTerminal bool, cancelErr error) {
+	t.Helper()
 	finished := app.readUntil(func(message gjson.Result) bool { return message.Get("method").String() == "turn/completed" })
 	require.Equal(t, app.turn, finished.Get("params.turn.id").String())
 	require.Equal(t, "interrupted", finished.Get("params.turn.status").String())
@@ -147,7 +211,7 @@ func testCodexCLI170OAuthCtxPoolCancelDeadline(t *testing.T, upstreamEvent strin
 		require.Equal(t, 11, canceled.result.Usage.InputTokens)
 		require.Equal(t, 2, canceled.result.Usage.OutputTokens)
 	} else {
-		require.ErrorIs(t, canceled.err, context.Canceled)
+		require.ErrorIs(t, canceled.err, cancelErr)
 		require.Nil(t, canceled.result, "without a terminal event there is no generation usage to bill")
 	}
 	require.NoError(t, app.stdin.Close())
