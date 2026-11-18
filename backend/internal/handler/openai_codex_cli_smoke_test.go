@@ -188,11 +188,10 @@ func TestCodexCLIResponsesSmoke(t *testing.T) {
 				}
 			}
 			require.Equal(t, 1, generations, "expected exactly one generation request")
-			if tc.readLimit != 0 {
-				require.Equal(t, 1, warmups, "WebSocket warmup must fit within the advertised limit")
+			if tc.useWS {
+				require.Equal(t, 1, warmups, "expected exactly one upstream WebSocket warmup")
 			}
 			if tc.rejectWebSocketTurn {
-				require.Equal(t, 1, warmups, "WebSocket must complete the warmup without retrying it")
 				require.Equal(t, 1, rejectedTurns, "fallback must not retry the WebSocket generation")
 			}
 			t.Logf("%s completed with %d upstream requests", tc.name, len(requests))

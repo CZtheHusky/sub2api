@@ -54,6 +54,7 @@ type openAIWSInterruptRead struct {
 var errOpenAIWSDrainContinued = errors.New("client continued the drained response")
 
 type openAIWSInterruptTurn struct {
+	clientPayload  []byte
 	liteTurnID     string
 	liteRejected   bool
 	terminalSeen   bool
@@ -99,7 +100,26 @@ func (t *openAIWSInterruptTurn) continues(queued *openAIWSClientReadResult) bool
 		return false
 	}
 	fields := gjson.GetManyBytes(queued.payload, "type", "previous_response_id", "client_metadata.turn_id")
-	return fields[0].Str == "response.create" && fields[1].Str == t.responseID && fields[2].Str == t.liteTurnID
+	if fields[0].Str != "response.create" || fields[2].Str != t.liteTurnID {
+		return false
+	}
+	if fields[1].Exists() {
+		return fields[1].Str == t.responseID
+	}
+	// When request settings change, Codex resends user history plus the
+	// steering input instead of referencing the completed response.
+	const userContents = `input.#(role=="user")#.content`
+	previous := gjson.GetBytes(t.clientPayload, userContents).Array()
+	if len(previous) == 0 {
+		return false
+	}
+	items := gjson.GetBytes(queued.payload, userContents).Array()
+	for i := 1; i < len(items); i++ {
+		if items[i-1].Raw == previous[len(previous)-1].Raw {
+			return true
+		}
+	}
+	return false
 }
 
 // A late acknowledgement belongs to the previous response on this lease,
@@ -263,11 +283,17 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 				err = writeOpenAIWSInterruptFailed(writeClient, id)
 			} else if turn.cancelDeadline.IsZero() {
 				turn.cancelDeadline = time.Now().Add(openAIWSInterruptTimeout)
-				writeCtx, cancelWrite := context.WithDeadline(r.ctx, turn.cancelDeadline)
+				writeCtx := r.ctx
+				var cancelWrite context.CancelFunc
+				if turn.liteTurnID == "" {
+					writeCtx, cancelWrite = context.WithDeadline(r.ctx, turn.cancelDeadline)
+				}
 				err = lease.WriteJSONWithContextTimeout(writeCtx, map[string]string{
 					"type": openAIWSInterruptRequested, "response_id": id, "mode": openAIWSInterruptMode,
 				}, writeTimeout)
-				cancelWrite()
+				if cancelWrite != nil {
+					cancelWrite()
+				}
 				if err == nil {
 					turn.awaitingAck = true
 					resetDeadline()

@@ -30,25 +30,32 @@ const (
 )
 
 func TestCodexCLI170OAuthCtxPoolSteering(t *testing.T) {
-	testCodexCLI170OAuthCtxPoolSteering(t, false, false)
+	testCodexCLI170OAuthCtxPoolSteering(t, "incremental")
 }
 
 func TestCodexCLI170OAuthCtxPoolSteeringAfterRejection(t *testing.T) {
 	t.Run("rejection before terminal", func(t *testing.T) {
-		testCodexCLI170OAuthCtxPoolSteering(t, true, false)
+		testCodexCLI170OAuthCtxPoolSteering(t, "reject before terminal")
 	})
 	t.Run("rejection after terminal", func(t *testing.T) {
-		testCodexCLI170OAuthCtxPoolSteering(t, false, true)
+		testCodexCLI170OAuthCtxPoolSteering(t, "reject after terminal")
 	})
 }
 
-func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, rejectBeforeTerminal, rejectAfterTerminal bool) {
+func TestCodexCLI170OAuthCtxPoolSteeringAfterEffortChange(t *testing.T) {
+	testCodexCLI170OAuthCtxPoolSteering(t, "changed effort")
+}
+
+func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, scenario string) {
 	t.Helper()
 	binary := requireCodexCLI170ResponsesLiteBinary(t)
 	server, upstream, dialer, results, proxyDone := startCodexCLI170OAuthCtxPoolSmokeGateway(t)
 	app := startCodexCLI170ResponsesLiteAppServer(t, binary, server.URL)
 	firstEvents := startCodexCLI170ResponsesLiteGeneration(t, app, upstream)
 
+	if scenario == "changed effort" {
+		app.call(5, "turn/settings/update", map[string]any{"threadId": app.thread, "turnId": app.turn, "effort": "high"})
+	}
 	const steeringText = "Continue with this steering detail"
 	reply := app.call(4, "turn/steer", map[string]any{
 		"threadId":       app.thread,
@@ -60,7 +67,7 @@ func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, rejectBeforeTerminal, rej
 	require.JSONEq(t, `{"type":"response.interrupt","response_id":"resp_generated","mode":"discard_partial_items"}`, string(control))
 
 	// A steering Drain waits for a terminal under the normal stream deadline.
-	if rejectBeforeTerminal {
+	if scenario == "reject before terminal" {
 		upstream.Send(codexCLI170Reject)
 	}
 	select {
@@ -71,19 +78,28 @@ func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, rejectBeforeTerminal, rej
 	for _, event := range firstEvents[3:] {
 		upstream.Send(event)
 	}
-	if rejectAfterTerminal {
+	if scenario == "reject after terminal" {
 		upstream.Send(codexCLI170Reject)
 	}
 
 	followUp := requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, 5*time.Second)
 	require.Equal(t, "response.create", gjson.GetBytes(followUp, "type").String())
-	require.Equal(t, "resp_generated", gjson.GetBytes(followUp, "previous_response_id").String())
+	previous := gjson.GetBytes(followUp, "previous_response_id")
 	require.Equal(t, app.turn, gjson.GetBytes(followUp, "client_metadata.turn_id").String())
 	input := gjson.GetBytes(followUp, "input").Array()
-	require.Len(t, input, 1, "the continuation carries only the new steering input")
-	require.Equal(t, "message", input[0].Get("type").String())
-	require.Equal(t, "user", input[0].Get("role").String())
-	require.Equal(t, steeringText, input[0].Get("content.0.text").String())
+	if scenario == "changed effort" {
+		require.False(t, previous.Exists())
+		require.Equal(t, "high", gjson.GetBytes(followUp, "reasoning.effort").String())
+		require.Contains(t, gjson.GetBytes(followUp, "input").Raw, "Generate a response we can interrupt")
+	} else {
+		require.Equal(t, "resp_generated", previous.String())
+		require.Len(t, input, 1, "the continuation carries only the new steering input")
+	}
+	require.NotEmpty(t, input)
+	last := input[len(input)-1]
+	require.Equal(t, "message", last.Get("type").String())
+	require.Equal(t, "user", last.Get("role").String())
+	require.Equal(t, steeringText, last.Get("content.0.text").String())
 	require.Equal(t, 1, dialer.DialCount(), "steering should continue from the drained response on the same upstream lease")
 	for _, event := range codexOAuthWSSmokeEvents(true) {
 		upstream.Send(strings.NewReplacer("resp_generated", "resp_steered", "msg_smoke", "msg_steered").Replace(event))
@@ -320,6 +336,7 @@ model_catalog_json = %q
 check_for_update_on_startup = false
 [features]
 interrupt_on_cancel = true
+step_model_switching = true
 plugins = false
 [model_providers.fixture]
 name = "Loopback fixture"
@@ -373,7 +390,7 @@ stream_max_retries = 0
 		require.True(t, reply.Get("result").Exists(), "%s: %s", method, reply.Raw)
 		return reply.Get("result")
 	}
-	call(1, "initialize", map[string]any{"clientInfo": map[string]string{"name": "sub2api-loopback", "version": "1.0.0"}})
+	call(1, "initialize", map[string]any{"capabilities": map[string]bool{"experimentalApi": true}, "clientInfo": map[string]string{"name": "sub2api-loopback", "version": "1.0.0"}})
 	require.NoError(t, encoder.Encode(map[string]string{"jsonrpc": "2.0", "method": "initialized"}))
 	thread := call(2, "thread/start", map[string]any{"cwd": cmd.Dir, "ephemeral": true}).Get("thread.id").String()
 	require.NotEmpty(t, thread)

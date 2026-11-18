@@ -1015,6 +1015,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		responseID := ""
 		interruptTurn := openAIWSInterruptTurn{}
 		if interruptReader != nil && isOpenAIResponsesLiteWebSocketPayload(clientPayload) {
+			interruptTurn.clientPayload = clientPayload
 			interruptTurn.liteTurnID = gjson.GetBytes(clientPayload, "client_metadata.turn_id").Str
 		}
 		writeTurnMessage := func(message []byte) error {
