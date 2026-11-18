@@ -756,6 +756,14 @@ export default {
         testMode: 'Test mode',
         testModeDefault: 'Default request',
         testModeCompact: 'Compact probe',
+        testModeDegradation: 'Model capability check',
+        degradationResult: '{verdict} · Closest reference: {model}',
+        degradationVerdicts: {
+          normal: 'Matches reference',
+          degraded: 'Suspected degradation',
+          uncertain: 'Inconclusive',
+          failed: 'Insufficient output'
+        },
         modelRestrictionDisabledByPassthrough: 'Automatic passthrough ignores model restrictions by default. Enable "Filter passthrough accounts by model" to use them for account selection only.',
       },
       grok: {

@@ -369,6 +369,12 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 		return s.sendErrorAndEnd(c, "Account not found")
 	}
 	bindAccountTestPlatform(c, account)
+	if normalizeAccountTestMode(mode) == AccountTestModeDegradation {
+		if !account.IsOpenAIOAuth() || account.IsCredentialShadow() || account.IsOpenAIAgentIdentity() || account.IsSyntheticUITest() {
+			return s.sendErrorAndEnd(c, "Degradation checks require a standard OpenAI OAuth account")
+		}
+		return s.testOpenAIAccountConnection(c, account, modelID, "", AccountTestModeDegradation)
+	}
 
 	// Synthetic UI load-test accounts exercise the real SSE parsing and modal
 	// interactions, but intentionally do not send their placeholder credentials
@@ -815,6 +821,14 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	if mode == AccountTestModeCompact {
 		return s.testOpenAICompactConnection(c, account, testModelID)
 	}
+	if mode == AccountTestModeDegradation {
+		if isOpenAIImageModel(testModelID) {
+			return s.sendErrorAndEnd(c, "Degradation checks require a text model")
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 120*time.Second)
+		defer cancel()
+	}
 
 	// Route to image generation test if an image model is selected
 	if isOpenAIImageModel(testModelID) {
@@ -891,6 +905,16 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		upstreamTestModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
 	payload := createOpenAITestPayload(upstreamTestModelID, isOAuth)
+	var challenge ModelTraceChallenge
+	if mode == AccountTestModeDegradation {
+		var err error
+		challenge, err = NewModelTraceChallenge()
+		if err != nil {
+			return s.sendErrorAndEnd(c, "Failed to create degradation check")
+		}
+		input := payload["input"].([]map[string]any)
+		input[0]["content"] = []map[string]any{{"type": "input_text", "text": challenge.Prompt}}
+	}
 	payloadBytes, _ := json.Marshal(payload)
 
 	// Send test_start event once. A task-invalid Agent Identity response may
@@ -956,6 +980,16 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	if mode == AccountTestModeDegradation {
+		if resp.StatusCode != http.StatusOK {
+			return s.sendErrorAndEnd(c, fmt.Sprintf("Degradation check upstream returned HTTP %d", resp.StatusCode))
+		}
+		return s.processOpenAIStreamWithDiagnostic(c, io.LimitReader(resp.Body, 2<<20), func(output string) {
+			verdict := EvaluateCodexDiagnostic(upstreamTestModelID, output, challenge)
+			s.sendEvent(c, TestEvent{Type: "degradation_result", Model: upstreamTestModelID, Status: verdict.Status, Code: verdict.Reason, Data: verdict})
+		})
+	}
 
 	if isOAuth && s.accountRepo != nil {
 		if updates, err := extractOpenAICodexProbeUpdates(resp); err == nil && len(updates) > 0 {
@@ -2960,8 +2994,13 @@ func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, 
 
 // processOpenAIStream processes the SSE stream from OpenAI Responses API
 func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader) error {
+	return s.processOpenAIStreamWithDiagnostic(c, body, nil)
+}
+
+func (s *AccountTestService) processOpenAIStreamWithDiagnostic(c *gin.Context, body io.Reader, diagnostic func(string)) error {
 	reader := bufio.NewReader(body)
 	seenCompleted := false
+	var output strings.Builder
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -3001,9 +3040,29 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 		case "response.output_text.delta":
 			// OpenAI Responses API uses "delta" field for text content
 			if delta, ok := data["delta"].(string); ok && delta != "" {
-				s.sendEvent(c, TestEvent{Type: "content", Text: delta})
+				if diagnostic == nil {
+					s.sendEvent(c, TestEvent{Type: "content", Text: delta})
+				} else {
+					output.WriteString(delta)
+				}
 			}
 		case "response.completed", "response.done":
+			if diagnostic != nil {
+				status := gjson.Get(jsonStr, "response.status").String()
+				if status != "" && status != "completed" {
+					return s.sendErrorAndEnd(c, "Degradation check did not complete")
+				}
+				if output.Len() == 0 {
+					for _, item := range gjson.Get(jsonStr, "response.output").Array() {
+						for _, part := range item.Get("content").Array() {
+							if part.Get("type").String() == "output_text" {
+								output.WriteString(part.Get("text").String())
+							}
+						}
+					}
+				}
+				diagnostic(output.String())
+			}
 			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 			return nil
 		case "response.failed":

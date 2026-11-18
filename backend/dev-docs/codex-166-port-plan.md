@@ -39,4 +39,10 @@ sub4api 的检测链是 `modeltrace_challenge.go`、分类数据与许可证、`
 
 - 本机 `codex --version` 为 0.166.0。使用独立测试配置与假凭据，回环 HTTP fake Responses 收到一次 `POST /v1/responses`、`stream=true`，CLI 获得 `LOOPBACK_OK` 并退出 0。这个结果验证 CLI 与夹具可用，尚未经过 sub2api 网关。
 - 可重跑 `python3 backend/scripts/codex-166-loopback-smoke.py`。脚本只启动短时本地服务器，使用隔离的 Codex 配置。
-- 已用 Go 1.27.4 运行版本同步、版本优先级和规范 UA 的定向回归，全部通过。WS 和网关端到端仍待移植后测试。真实账号验证按约定仅在 ccvps 执行。
+- 已用 Go 1.27.4 运行版本同步、版本优先级和规范 UA 的定向回归，全部通过。WS 和网关端到端仍待移植后测试。真实账号验证按约定仅在 实际部署环境 执行。
+
+## 首批移植进度
+
+- 新上游已保留 turn metadata 中 `guardian_recorded_items` 的 `true`、`false` 和字段省略含义，补上回归用例。
+- 管理员可在标准 OpenAI OAuth 账号的测试面板运行一次降智检测。HTTP 探针复用现有账号测试传输，使用内置 ModelTrace 参考库，展示判定与最接近的参考模型。断流、限流等请求错误与降智判定分开处理，探针不修改账号的限流和调度状态。
+- 自动检测、历史、WebSocket 探针和 CLI 经网关的端到端验证尚待实现或执行。

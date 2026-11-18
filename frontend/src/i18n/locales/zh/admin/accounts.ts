@@ -875,6 +875,14 @@ export default {
         testMode: '测试模式',
         testModeDefault: '常规请求',
         testModeCompact: 'Compact 探测',
+        testModeDegradation: '降智检测',
+        degradationResult: '{verdict} · 最接近的参考模型：{model}',
+        degradationVerdicts: {
+          normal: '匹配参考模型',
+          degraded: '疑似降智',
+          uncertain: '结果不确定',
+          failed: '有效输出不足'
+        },
         modelRestrictionDisabledByPassthrough: '自动透传默认忽略模型限制；开启“透传时按账号模型筛选”后，模型限制仅用于筛选候选账号。',
       },
       grok: {

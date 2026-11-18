@@ -413,7 +413,7 @@ const generatedImages = ref<PreviewMedia[]>([])
 const generatedAudios = ref<PreviewMedia[]>([])
 const generatedVideos = ref<PreviewMedia[]>([])
 const previewImageUrl = ref('')
-const testMode = ref<'default' | 'compact'>('default')
+const testMode = ref<'default' | 'compact' | 'degradation'>('default')
 const grokTestMode = ref<'text' | 'image' | 'video' | 'search' | 'tts' | 'stt' | 'realtime'>('text')
 const uploadImageDataURL = ref('')
 const uploadImagePreview = ref('')
@@ -426,7 +426,10 @@ const isOpenAIAccount = computed(() => props.account?.platform === 'openai')
 const isGrokAccount = computed(() => props.account?.platform === 'grok')
 const openAITestModeOptions = computed(() => [
   { value: 'default', label: t('admin.accounts.openai.testModeDefault') },
-  { value: 'compact', label: t('admin.accounts.openai.testModeCompact') }
+  { value: 'compact', label: t('admin.accounts.openai.testModeCompact') },
+  ...(props.account?.type === 'oauth'
+    ? [{ value: 'degradation', label: t('admin.accounts.openai.testModeDegradation') }]
+    : [])
 ])
 const grokTestModeOptions = computed(() => [
   { value: 'text', label: t('admin.accounts.grok.testModeText') },
@@ -948,6 +951,8 @@ const handleEvent = (event: {
   audio_url?: string
   video_url?: string
   mime_type?: string
+  status?: string
+  data?: { predicted_model?: string }
 }) => {
   switch (event.type) {
     case 'test_start':
@@ -1020,6 +1025,13 @@ const handleEvent = (event: {
       if (event.text) {
         addLine(event.text, 'text-cyan-300')
       }
+      break
+
+    case 'degradation_result':
+      addLine(t('admin.accounts.openai.degradationResult', {
+        verdict: t(`admin.accounts.openai.degradationVerdicts.${event.status || 'failed'}`),
+        model: event.data?.predicted_model || '—'
+      }), event.status === 'normal' ? 'text-green-400' : 'text-yellow-400')
       break
 
     case 'test_complete':

@@ -36,6 +36,9 @@ vi.mock('vue-i18n', async () => {
         if (key === 'admin.accounts.imagePreviewAlt' && params?.index) {
           return `test-image-${params.index}`
         }
+        if (key === 'admin.accounts.openai.degradationResult') {
+          return `${params?.verdict} (${params?.model})`
+        }
         return messages[key] || key
       }
     })
@@ -219,5 +222,35 @@ describe('AccountTestModal', () => {
       prompt: '',
       mode: 'compact'
     })
+  })
+
+  it('OpenAI 降智检测保留不确定判定，并显示最接近的参考模型', async () => {
+    getAvailableModels.mockResolvedValue([{ id: 'gpt-6.2-sol', display_name: 'GPT-6.2 Sol' }])
+    const fetchMock = vi.fn().mockResolvedValue(createStreamResponse([
+      'data: {"type":"degradation_result","status":"uncertain","data":{"predicted_model":"gpt-6-sol"}}\n',
+      'data: {"type":"test_complete","success":true}\n'
+    ]))
+    global.fetch = fetchMock
+
+    const wrapper = mountModal({
+      id: 42,
+      name: 'OpenAI OAuth',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'active'
+    })
+    await wrapper.setProps({ show: true })
+    await flushPromises()
+
+    ;(wrapper.vm as any).selectedModelId = 'gpt-6.2-sol'
+    ;(wrapper.vm as any).testMode = 'degradation'
+    await (wrapper.vm as any).startTest()
+    await flushPromises()
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      model_id: 'gpt-6.2-sol',
+      mode: 'degradation'
+    })
+    expect(wrapper.text()).toContain('admin.accounts.openai.degradationVerdicts.uncertain (gpt-6-sol)')
   })
 })

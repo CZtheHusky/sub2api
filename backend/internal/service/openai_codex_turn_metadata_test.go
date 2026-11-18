@@ -65,6 +65,8 @@ func TestCodexTurnMetadataRewritePreservesHeaderSafeJSON(t *testing.T) {
 		`{"installation_id":"client-install","workspaces":{"C:\\work\\中文🚀":{"label":"café"}},"literal":"\\u4e2d","quote":"\"\\","controls":"\b\f\n\r\t\u0000\u007f","timestamp":1789302780858,"enabled":true}`,
 		`{"installation_id":"client-install","workspaces":{"C:\\work\\\u4e2d\u6587\ud83d\ude80":{"label":"caf\u00e9"}},"literal":"\\u4e2d","quote":"\"\\","controls":"\b\f\n\r\t\u0000\u007f","timestamp":1789302780858,"enabled":true}`,
 		`{"installation_id":"client-install","workspaces":{"C:\\work\\ascii":{}},"literal":"\\u4e2d"}`,
+		`{"guardian_recorded_items":true,"installation_id":"client-install","subagent_kind":"guardian"}`,
+		`{"guardian_recorded_items":false,"installation_id":"client-install","subagent_kind":"guardian"}`,
 	} {
 		var original map[string]any
 		require.NoError(t, json.Unmarshal([]byte(raw), &original))
@@ -77,6 +79,9 @@ func TestCodexTurnMetadataRewritePreservesHeaderSafeJSON(t *testing.T) {
 					if key != "installation_id" {
 						require.Equal(t, value, decoded[key], key)
 					}
+				}
+				if _, supplied := original["guardian_recorded_items"]; !supplied {
+					require.NotContains(t, decoded, "guardian_recorded_items")
 				}
 				require.NotEqual(t, original["installation_id"], decoded["installation_id"])
 				for _, b := range []byte(updated) {

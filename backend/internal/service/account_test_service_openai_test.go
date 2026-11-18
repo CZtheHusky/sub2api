@@ -137,6 +137,50 @@ func TestAccountTestService_OpenAISuccessPersistsSnapshotFromHeaders(t *testing.
 	require.Contains(t, recorder.Body.String(), "test_complete")
 }
 
+func TestAccountTestService_DegradationChecksDoNotChangeAccountState(t *testing.T) {
+	sample, _ := referenceSampleText(t, "gpt-6-sol")
+	stream := fmt.Sprintf("data: {\"type\":\"response.output_text.delta\",\"delta\":%q}\n\n", sample)
+	for _, tc := range []struct {
+		name, ending, want string
+		code               int
+	}{
+		{name: "completed", code: http.StatusOK, ending: "data: {\"type\":\"response.completed\"}\n\n", want: "uncertain"},
+		{name: "disconnected", code: http.StatusOK},
+		{name: "rate limited", code: http.StatusTooManyRequests},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, recorder := newTestContext()
+			resp := newJSONResponse(tc.code, stream+tc.ending)
+			resp.Header.Set("x-codex-primary-used-percent", "100")
+			repo := &openAIAccountTestRepo{}
+			upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
+			svc := &AccountTestService{accountRepo: repo, httpUpstream: upstream}
+			account := &Account{
+				ID: 89, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1,
+				Credentials: map[string]any{"access_token": "test-token"},
+			}
+			err := svc.testOpenAIAccountConnection(ctx, account, "gpt-6.2-sol", "", AccountTestModeDegradation)
+			require.Len(t, upstream.requests, 1)
+			body, readErr := io.ReadAll(upstream.requests[0].Body)
+			require.NoError(t, readErr)
+			require.Contains(t, gjson.GetBytes(body, "input.0.content.0.text").String(), "1 到 355")
+			require.False(t, gjson.GetBytes(body, "store").Bool())
+			require.Empty(t, repo.updatedExtra)
+			require.Zero(t, repo.rateLimitedID)
+			require.Zero(t, repo.setErrorID)
+			if tc.want == "" {
+				require.Error(t, err)
+				require.NotContains(t, recorder.Body.String(), "degradation_result")
+				return
+			}
+			require.NoError(t, err)
+			require.Contains(t, recorder.Body.String(), "degradation_result")
+			require.Contains(t, recorder.Body.String(), "\"status\":\""+tc.want+"\"")
+			require.Contains(t, recorder.Body.String(), "\"predicted_model\":\"gpt-6-sol\"")
+		})
+	}
+}
+
 func TestAccountTestService_OpenAIOAuthTestNormalizesGPT56Alias(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := newTestContext()
