@@ -46,3 +46,18 @@ sub4api 的检测链是 `modeltrace_challenge.go`、分类数据与许可证、`
 - 新上游已保留 turn metadata 中 `guardian_recorded_items` 的 `true`、`false` 和字段省略含义，补上回归用例。
 - 管理员可在标准 OpenAI OAuth 账号的测试面板运行一次降智检测。HTTP 探针复用现有账号测试传输，使用内置 ModelTrace 参考库，展示判定与最接近的参考模型。断流、限流等请求错误与降智判定分开处理，探针不修改账号的限流和调度状态。
 - 自动检测、历史、WebSocket 探针和 CLI 经网关的端到端验证尚待实现或执行。
+
+## 0.170.0 分支
+
+`codex/client-compat-0.170.0` 从上述手动检测提交 `bb7261b9c` 分出。内置客户端版本升到 0.170.0，版本自动同步默认关闭。对照的官方源码是 [rust-v0.170.0](https://github.com/openai/codex/tree/rust-v0.170.0)。
+
+- Responses WebSocket 握手通过 `X-Codex-WebSocket-Max-Message-Bytes` 公布网关实际的消息上限。CLI 可以在发送过大的请求前改用 HTTP。[客户端实现](https://github.com/openai/codex/pull/60841)
+- 如果上游在本轮发回任何响应帧前因消息过大而以 `1009` 关闭，网关将关闭码送回客户端。该轮已被上游拒绝，网关会结束本轮 WS 转发，由 CLI 切换 HTTP。已有响应帧的情况按流中断处理。[客户端错误处理](https://github.com/openai/codex/pull/60840)
+- HTTP SSE 转发保留 `response.incomplete` 终态中上游提供的非空输出。CLI 记录失败轨迹时可以读取最后生成的部分内容。[客户端实现](https://github.com/openai/codex/pull/58456)
+- 本机使用独立配置、测试密钥和回环上游，通过真实网关 handler 和转发服务验证 HTTP、WebSocket 和超限后转 HTTP。超限用例将握手上限设为 8 KiB，检查假上游恰好收到一次 WS 预热和一次 HTTP 生成。端到端夹具使用 API Key 类型的测试账号。OAuth 常规转发和透传另以假凭据和内存 HTTP 上游验证可选的 `prompt_cache_options.ttl`。
+
+安装 0.170.0 后，从 `backend` 目录执行：
+
+```sh
+SUB2API_CODEX_SMOKE_BINARY="$(command -v codex)" go test -tags=unit ./internal/handler -run '^TestCodexCLIResponsesSmoke$' -count=1 -v
+```

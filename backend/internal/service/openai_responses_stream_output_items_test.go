@@ -102,6 +102,17 @@ func TestNormalizeResponsesStreamingTerminalOutputRepairsTruncatedOutput(t *test
 		"the id the stream reported must replace the fabricated one")
 }
 
+func TestNormalizeResponsesStreamingTerminalOutputPreservesIncompleteSnapshot(t *testing.T) {
+	doneItems := newResponsesStreamOutputItems()
+	doneItems.Observe([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}`))
+	doneItems.Observe([]byte(`{"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message"}}`))
+	raw := []byte(`{"type":"response.incomplete","response":{"status":"incomplete","output":[{"type":"message","status":"incomplete","id":"msg_partial","content":[{"type":"output_text","text":"unfinished"}]}]}}`)
+
+	normalized, changed := normalizeResponsesStreamingTerminalOutput(raw, nil, doneItems, nil)
+	require.False(t, changed)
+	require.Equal(t, raw, normalized)
+}
+
 // A terminal output that is already complete is never rewritten.
 func TestNormalizeResponsesStreamingTerminalOutputLeavesCompleteOutputAlone(t *testing.T) {
 	doneItems := newResponsesStreamOutputItems()

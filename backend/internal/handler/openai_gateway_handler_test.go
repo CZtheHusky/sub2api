@@ -1132,6 +1132,49 @@ func TestOpenAIResponsesWebSocket_FirstMessageTimeoutUsesConfig(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestOpenAIResponsesWebSocket_AdvertisesAndEnforcesMessageReadLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const readLimit = 128
+	const header = "X-Codex-WebSocket-Max-Message-Bytes"
+
+	h := newOpenAIHandlerForPreviousResponseIDValidation(t, nil)
+	h.cfg = &config.Config{}
+	h.cfg.Gateway.OpenAIWS.ClientReadLimitBytes = readLimit
+	wsServer := newOpenAIWSHandlerTestServer(t, h, middleware.AuthSubject{UserID: 1, Concurrency: 1})
+	t.Cleanup(wsServer.Close)
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http") + "/openai/v1/responses"
+
+	for _, tt := range []struct {
+		name       string
+		bytes      int
+		wantClose  coderws.StatusCode
+		wantReason string
+	}{
+		{name: "at advertised limit reaches payload validation", bytes: readLimit, wantClose: coderws.StatusPolicyViolation, wantReason: "invalid JSON payload"},
+		{name: "over advertised limit gets the HTTP fallback signal", bytes: readLimit + 1, wantClose: coderws.StatusMessageTooBig},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			conn, resp, err := coderws.Dial(ctx, wsURL, nil)
+			require.NoError(t, err)
+			defer func() { _ = conn.CloseNow() }()
+			require.Equal(t, "128", resp.Header.Get(header))
+
+			// A deliberately invalid payload distinguishes successful frame reads
+			// followed by JSON validation from frame-level rejection.
+			require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(strings.Repeat("!", tt.bytes))))
+			_, _, err = conn.Read(ctx)
+			var closeErr coderws.CloseError
+			require.ErrorAs(t, err, &closeErr)
+			require.Equal(t, tt.wantClose, closeErr.Code)
+			if tt.wantReason != "" {
+				require.Equal(t, tt.wantReason, closeErr.Reason)
+			}
+		})
+	}
+}
+
 func TestOpenAIResponsesWebSocket_IngressLeaseReleasedOnEarlyReturn(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cache := &concurrencyCacheMock{

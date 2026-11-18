@@ -2263,6 +2263,11 @@ func normalizeResponsesStreamingTerminalOutput(data []byte, acc *apicompat.Buffe
 	hasAccumulatedOutput := (acc != nil && acc.HasContent()) || len(imageOutputs) > 0 || doneItems.HasItems()
 	if output.Exists() && output.IsArray() {
 		terminalCount := len(output.Array())
+		// Codex uses the incomplete response's snapshot for failure traces.
+		// It can contain partial items never reported by output_item.done.
+		if eventType == "response.incomplete" && terminalCount > 0 {
+			return data, false
+		}
 		// A terminal output carrying at least as many items as the stream
 		// reported is left untouched. Carrying fewer means the terminal
 		// dropped items the stream already reported as done, and those

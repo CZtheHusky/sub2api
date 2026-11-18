@@ -70,6 +70,8 @@ type RelayExit struct {
 	WroteDownstream bool
 }
 
+const RelayStageUpstreamMessageTooBig = "upstream_message_too_big"
+
 type RelayOptions struct {
 	WriteTimeout                    time.Duration
 	IdleTimeout                     time.Duration
@@ -549,8 +551,13 @@ func runUpstreamToClient(
 	for {
 		msgType, payload, err := upstreamConn.ReadFrame(ctx)
 		if err != nil {
+			stage := "read_upstream"
+			messageTooBig := coderws.CloseStatus(err) == coderws.StatusMessageTooBig
+			if messageTooBig && state.hasUnfinishedTurn() && !state.turnWroteDownstream.Load() {
+				stage = RelayStageUpstreamMessageTooBig
+			}
 			emitTurnComplete(onTurnComplete, state, finalizePendingBareError(state, nowFn()))
-			graceful := isDisconnectError(err)
+			graceful := !messageTooBig && isDisconnectError(err)
 			// A clean WebSocket close only describes the transport handshake. Once
 			// the upstream has started a Responses turn, success still requires a
 			// terminal protocol event. Treat an early 1000/EOF as a relay failure so
@@ -567,7 +574,7 @@ func runUpstreamToClient(
 				WroteDownstream: wroteDownstream,
 			})
 			exitCh <- relayExitSignal{
-				stage:           "read_upstream",
+				stage:           stage,
 				err:             err,
 				graceful:        graceful,
 				wroteDownstream: wroteDownstream,
@@ -731,7 +738,7 @@ func relayDirectionFromStage(stage string) string {
 	switch stage {
 	case "read_client", "write_upstream":
 		return "client_to_upstream"
-	case "read_upstream", "write_client", "drain_terminal":
+	case "read_upstream", RelayStageUpstreamMessageTooBig, "write_client", "drain_terminal":
 		return "upstream_to_client"
 	case "idle_timeout":
 		return "watchdog"

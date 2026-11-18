@@ -316,9 +316,9 @@ func TestGetOpenAICodexClientVersionPriority(t *testing.T) {
 	}{
 		{name: "面板覆写优先", override: "0.150.0", synced: "0.146.0", autoSync: "true", want: "0.150.0"},
 		{name: "覆写为空时用同步值", synced: "0.146.0", autoSync: "true", want: "0.146.0"},
-		{name: "默认使用对齐版本", want: "0.166.0"},
-		{name: "默认忽略上次同步值", synced: "0.200.1", want: "0.166.0"},
-		{name: "关闭后忽略上次同步值", synced: "0.200.1", autoSync: "false", want: "0.166.0"},
+		{name: "默认使用对齐版本", want: "0.170.0"},
+		{name: "默认忽略上次同步值", synced: "0.200.1", want: "0.170.0"},
+		{name: "关闭后忽略上次同步值", synced: "0.200.1", autoSync: "false", want: "0.170.0"},
 		{name: "关闭后仍尊重手填版本", override: "0.150.0", synced: "0.200.1", autoSync: "false", want: "0.150.0"},
 		{name: "非法覆写回退同步值", override: "latest", synced: "0.146.0", autoSync: "true", want: "0.146.0"},
 		{name: "非法同步值回退内置常量", synced: "not-a-version", autoSync: "true", want: codexCLIVersion},

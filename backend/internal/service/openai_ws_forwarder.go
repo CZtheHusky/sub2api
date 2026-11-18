@@ -83,6 +83,8 @@ func wrapOpenAIWSFallback(reason string, err error) error {
 	return &openAIWSFallbackError{Reason: strings.TrimSpace(reason), Err: err}
 }
 
+const openAIWSUpstreamMessageTooBigReason = "upstream websocket message too large"
+
 // OpenAIWSClientCloseError 表示应以指定 WebSocket close code 主动关闭客户端连接的错误。
 type OpenAIWSClientCloseError struct {
 	statusCode coderws.StatusCode
@@ -169,6 +171,9 @@ func isOpenAIWSIngressTurnRetryable(err error) bool {
 		return false
 	}
 	if turnErr.wroteDownstream {
+		return false
+	}
+	if coderws.CloseStatus(turnErr.cause) == coderws.StatusMessageTooBig {
 		return false
 	}
 	switch turnErr.stage {

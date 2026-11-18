@@ -90,6 +90,30 @@ func (u *httpUpstreamRecorder) DoWithTLS(req *http.Request, proxyURL string, acc
 	return u.Do(req, proxyURL, accountID, accountConcurrency)
 }
 
+func TestOpenAIGatewayService_CodexOAuthPreservesTurnCacheTTL(t *testing.T) {
+	for _, mode := range []struct {
+		name        string
+		passthrough bool
+	}{
+		{name: "transformed"},
+		{name: "passthrough", passthrough: true},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			upstream := instructionsEchoUpstream(`"test"`)
+			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			c.Request.Header.Set("User-Agent", "codex_exec/0.170.0")
+			SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
+			body := []byte(`{"model":"gpt-6.1-sol","stream":true,"instructions":"test","input":"hello","prompt_cache_options":{"ttl":"12h"}}`)
+
+			_, err := svc.Forward(context.Background(), c, instructionsEchoOAuthAccount(mode.passthrough), body)
+			require.NoError(t, err)
+			require.JSONEq(t, `{"ttl":"12h"}`, gjson.GetBytes(upstream.lastBody, "prompt_cache_options").Raw)
+		})
+	}
+}
+
 func TestOpenAIGatewayService_ResponsesUnknownModelDoesNotFallbackToGPT54(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

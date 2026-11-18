@@ -1014,6 +1014,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			upstreamMessage, readErr := lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
 			if readErr != nil {
 				lease.MarkBroken()
+				if !wroteDownstream && coderws.CloseStatus(readErr) == coderws.StatusMessageTooBig {
+					closeErr := NewOpenAIWSClientCloseError(coderws.StatusMessageTooBig, openAIWSUpstreamMessageTooBigReason, readErr)
+					return nil, wrapOpenAIWSIngressTurnError("read_upstream", closeErr, false)
+				}
 				return nil, wrapOpenAIWSIngressTurnError(
 					"read_upstream",
 					fmt.Errorf("read upstream websocket event: %w", readErr),

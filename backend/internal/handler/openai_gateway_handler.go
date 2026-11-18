@@ -2544,6 +2544,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		c.Request = c.Request.WithContext(ctx)
 	}
 
+	// Codex can fall back to HTTP before sending a message above this limit.
+	clientReadLimit := service.ResolveOpenAIWSClientReadLimitBytes(h.cfg)
+	c.Header("X-Codex-WebSocket-Max-Message-Bytes", strconv.FormatInt(clientReadLimit, 10))
 	wsConn, err := coderws.Accept(c.Writer, c.Request, &coderws.AcceptOptions{
 		CompressionMode: coderws.CompressionContextTakeover,
 	})
@@ -2562,7 +2565,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	defer func() {
 		_ = wsConn.CloseNow()
 	}()
-	wsConn.SetReadLimit(service.ResolveOpenAIWSClientReadLimitBytes(h.cfg))
+	wsConn.SetReadLimit(clientReadLimit)
 
 	firstMessageTimeout := service.ResolveOpenAIWSClientFirstMessageTimeout(h.cfg)
 	msgType, firstMessage, err := service.ReadOpenAIWSClientMessage(
@@ -2576,6 +2579,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		if errors.Is(context.Cause(ctx), service.ErrOpenAIWSIngressLeaseLost) {
 			reqLog.Warn("openai.websocket_ingress_lease_lost_before_first_message", zap.Error(err))
 			closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "websocket ingress capacity lease lost; please reconnect")
+			return
+		}
+		if errors.Is(err, coderws.ErrMessageTooBig) {
+			// The WebSocket reader has already sent close code 1009.
+			reqLog.Warn("openai.websocket_first_message_too_large", zap.Int64("limit_bytes", clientReadLimit))
 			return
 		}
 		closeStatus, closeReason := summarizeWSCloseErrorForLog(err)
@@ -3365,6 +3373,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 
 			var closeErr *service.OpenAIWSClientCloseError
 			hasClientCloseErr := errors.As(err, &closeErr)
+			if hasClientCloseErr && closeErr.StatusCode() == coderws.StatusMessageTooBig {
+				reqLog.Info("openai.websocket_upstream_message_too_large", zap.Int64("account_id", account.ID))
+				closeOpenAIClientWS(wsConn, closeErr.StatusCode(), closeErr.Reason())
+				return
+			}
 			if openAIWSIngressEndedByClient(err) {
 				closedFields := []zap.Field{zap.Int64("account_id", account.ID)}
 				if hasClientCloseErr {
