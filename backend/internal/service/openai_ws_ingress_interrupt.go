@@ -37,9 +37,25 @@ type openAIWSIngressInterrupt struct {
 	reading       chan openAIWSClientReadResult
 	queued        *openAIWSClientReadResult
 	drainDeadline time.Time
+
+	// A steering continuation can arrive while the read for the preceding ACK
+	// is in flight. The next turn on this lease consumes that very same read.
+	pending      *openAIWSInterruptRead
+	drainedLease *openAIWSConnLease
+	drainedIDs   map[string]bool
 }
 
+type openAIWSInterruptRead struct {
+	lease  *openAIWSConnLease
+	result chan openAIWSClientReadResult
+	cancel context.CancelFunc
+}
+
+var errOpenAIWSDrainContinued = errors.New("client continued the drained response")
+
 type openAIWSInterruptTurn struct {
+	liteTurnID     string
+	terminalSeen   bool
 	responseID     string
 	awaitingAck    bool
 	cancelDeadline time.Time
@@ -77,6 +93,57 @@ func (r *openAIWSIngressInterrupt) readClient() openAIWSClientReadResult {
 	return result
 }
 
+func (t *openAIWSInterruptTurn) continues(queued *openAIWSClientReadResult) bool {
+	if t.liteTurnID == "" || queued == nil || queued.err != nil {
+		return false
+	}
+	fields := gjson.GetManyBytes(queued.payload, "type", "previous_response_id", "client_metadata.turn_id")
+	return fields[0].Str == "response.create" && fields[1].Str == t.responseID && fields[2].Str == t.liteTurnID
+}
+
+// A late acknowledgement belongs to the previous response on this lease,
+// never to a cancellation that may already be active on the following turn.
+func (r *openAIWSIngressInterrupt) consumeDrainedAck(lease *openAIWSConnLease, kind string, body []byte) bool {
+	if r.drainedLease != lease || (kind != openAIWSInterruptAccepted && kind != openAIWSInterruptFailed) {
+		return false
+	}
+	fields, valid := openAIWSInterruptFields(body)
+	id := fields["response_id"]
+	if !valid || fields["type"] != kind || !r.drainedIDs[id] {
+		return false
+	}
+	delete(r.drainedIDs, id)
+	if len(r.drainedIDs) == 0 {
+		r.drainedLease = nil
+	}
+	return true
+}
+
+func (r *openAIWSIngressInterrupt) releaseLease(lease *openAIWSConnLease) {
+	if r.drainedLease == lease {
+		// An optional ACK must never be delivered to another pool borrower.
+		lease.abort()
+		r.drainedIDs = nil
+		r.drainedLease = nil
+	}
+	if pending := r.pending; pending != nil && pending.lease == lease {
+		pending.cancel()
+		<-pending.result
+		r.pending = nil
+	}
+}
+
+func (r *openAIWSIngressInterrupt) readFirst(lease *openAIWSConnLease, timeout time.Duration) ([]byte, error) {
+	if r.pending != nil && r.pending.lease == lease {
+		read := r.pending
+		r.pending = nil
+		defer read.cancel()
+		result := <-read.result
+		return result.payload, result.err
+	}
+	return lease.ReadMessageWithContextTimeout(r.ctx, timeout)
+}
+
 func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *openAIWSInterruptTurn, readTimeout, writeTimeout time.Duration, writeClient func([]byte) error) ([]byte, error) {
 	deadline, deadlineErr := r.readDeadline(turn)
 	if !deadline.IsZero() && !time.Now().Before(deadline) {
@@ -84,7 +151,12 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 	}
 	r.startRead()
 	readCtx, cancel := context.WithCancel(r.ctx)
-	defer cancel()
+	keepRead := false
+	defer func() {
+		if !keepRead {
+			cancel()
+		}
+	}()
 	upstream := make(chan openAIWSClientReadResult, 1)
 	go func() {
 		body, err := lease.ReadMessageWithContextTimeout(readCtx, readTimeout)
@@ -114,6 +186,16 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 		return nil, err
 	}
 	for {
+		if turn.terminalSeen && turn.continues(r.queued) {
+			keepRead = true
+			r.pending = &openAIWSInterruptRead{lease: lease, result: upstream, cancel: cancel}
+			r.drainedLease = lease
+			if r.drainedIDs == nil {
+				r.drainedIDs = make(map[string]bool)
+			}
+			r.drainedIDs[turn.responseID] = true
+			return nil, errOpenAIWSDrainContinued
+		}
 		select {
 		case result := <-upstream:
 			return result.payload, result.err
@@ -129,12 +211,16 @@ func (r *openAIWSIngressInterrupt) readUpstream(lease *openAIWSConnLease, turn *
 					return endRead(result.err)
 				}
 				r.queued = &result
+				if turn.liteTurnID != "" && !turn.cancelDeadline.IsZero() {
+					return endRead(context.Canceled)
+				}
 				r.startDrain()
 				resetDeadline()
 				continue
 			}
 			if gjson.GetBytes(result.payload, "type").String() != openAIWSInterruptRequested {
 				r.queued = &result
+				resetDeadline()
 				continue
 			}
 			id, valid := parseOpenAIWSInterrupt(result.payload)
@@ -206,7 +292,10 @@ func (r *openAIWSIngressInterrupt) readDeadline(turn *openAIWSInterruptTurn) (ti
 		}
 		return r.drainDeadline, context.Canceled
 	}
-	if !turn.cancelDeadline.IsZero() {
+	// Responses Lite sends identical control frames for Drain and Cancel. The
+	// native client closes the socket on its Cancel deadline. Drain may take
+	// longer and continue the same logical turn on the same connection.
+	if !turn.cancelDeadline.IsZero() && (turn.liteTurnID == "" || (r.queued != nil && !turn.continues(r.queued))) {
 		return turn.cancelDeadline, errOpenAIWSInterruptTimeout
 	}
 	return time.Time{}, nil
@@ -232,8 +321,13 @@ func (t *openAIWSInterruptTurn) recordAck(kind string, payload []byte) error {
 }
 
 func (r *openAIWSIngressInterrupt) finishTurn(lease *openAIWSConnLease, turn *openAIWSInterruptTurn, readTimeout, writeTimeout time.Duration, writeClient func([]byte) error) error {
+	turn.terminalSeen = true
 	for {
 		payload, err := r.readUpstream(lease, turn, readTimeout, writeTimeout, writeClient)
+		if errors.Is(err, errOpenAIWSDrainContinued) {
+			turn.awaitingAck = false
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -241,6 +335,9 @@ func (r *openAIWSIngressInterrupt) finishTurn(lease *openAIWSConnLease, turn *op
 			return context.Canceled
 		}
 		kind := gjson.GetBytes(payload, "type").String()
+		if r.consumeDrainedAck(lease, kind, payload) {
+			continue
+		}
 		switch kind {
 		case openAIWSInterruptAccepted, openAIWSInterruptFailed:
 			if err := turn.recordAck(kind, payload); err != nil {
@@ -253,7 +350,7 @@ func (r *openAIWSIngressInterrupt) finishTurn(lease *openAIWSConnLease, turn *op
 				return errOpenAIWSInterruptRejected
 			}
 			return nil
-		case "codex.response.metadata", "codex.rate_limits":
+		case "codex.response.metadata", "codex.rate_limits", "responsesapi.websocket_timing":
 			if err := writeClient(payload); err != nil {
 				return err
 			}

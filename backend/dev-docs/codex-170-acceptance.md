@@ -46,21 +46,23 @@ go test -tags=unit ./internal/service/openai_ws_v2 -run '^TestRelay_UpstreamMess
 
 | 场景 | 观测与结论 |
 | --- | --- |
-| HTTP 常规 OAuth 和透传 | 对同一次 CLI 请求核对模型、输入、工具声明、流式参数和终态。6.1 Sol 默认使用输入中的 `additional_tools`，5.4 样例使用顶层工具。客户端省略顶层 `instructions`，将指令放在 developer 消息中。常规 OAuth 原先额外合成默认指令，已修复；两种模式和两种样例均通过。 |
+| HTTP 常规 OAuth 和透传 | 对同一次 CLI 请求核对模型、输入、工具声明和流式参数。常规 OAuth 的 SSE 送回真实 CLI；透传模式的答案和终态由 Go 响应记录器核对。6.1 Sol 默认使用输入中的 `additional_tools`，5.4 样例使用顶层工具。客户端省略顶层 `instructions`，将指令放在 developer 消息中。常规 OAuth 原先额外合成默认指令，已修复；两种模式和两种样例均通过。 |
 | HTTP 出站差异 | 采样日志中 CLI exec 和网关的 User-Agent 不同。两个网关转发模式均断言出站 `Version: 0.170.0`、JSON 内容类型和 SSE 接收类型。OAuth 还会规范化 `additional_tools` 声明 ID 的 UUID 拼写。 |
 | WS OAuth passthrough | 对照直连和经网关的两次 CLI 运行。各收到一次预热和一次生成，二者均通过 `previous_response_id` 引用预热响应。比较 `type`、`model`、`stream`、`generate`、`previous_response_id`、`instructions`、`tools`、`tool_choice`、`parallel_tool_calls`、`reasoning`、`include`、`store`、`text`、`service_tier`、`prompt_cache_options` 的存在性和值。输入逐项比较内容和 ID 类型前缀。假上游在 CLI 通过增量事件读到完整文本后，才发送含完整答案的完成事件。 |
-| OAuth ctx_pool 生成中取消 | 真实 0.170.0 app-server 在支持 Responses Lite 的模型上显式启用 `interrupt_on_cancel`，收到部分文本后取消。在假上游发送终态前，网关通过本轮原租约转发匹配 response ID 的 interrupt。客户端收到确认和终态，回合为 `interrupted`，网关收到终态用量。该 CLI 功能默认关闭。 |
+| OAuth ctx_pool 生成中取消 | 真实 0.170.0 app-server 在支持 Responses Lite 的模型上显式启用 `interrupt_on_cancel`，收到部分文本后取消。在假上游发送终态前，网关通过本轮原租约转发匹配 response ID 的 interrupt。在通往 CLI 的 WS 上捕获到匹配的 ACK 和终态，app-server 报告回合为 `interrupted`，网关回调报告终态用量。扣掉下行 ACK 的负对照在 WS 断言处失败。该 CLI 功能默认关闭。 |
+| OAuth ctx_pool 生成中追加输入 | 真实 0.170.0 app-server 使用 `turn/steer`。假上游收到 interrupt 后等待 1.2 秒再发送终态，全程不发 ACK。CLI 在原 WS 上用同一个 `turn_id` 和刚结束的 `previous_response_id` 续发生成，追加的用户消息到达上游。 |
 | ctx_pool 收到 1009 后转普通 OAuth HTTP | 用固定用户条目 ID 对照同一客户端的 WS 尝试与 HTTP 重发。无工具、无续链的测试请求在修复前丢失 ID，修复后两端均收到原 ID。本例采用构造请求以覆盖真实 CLI 默认工具配置未必触发的删除分支。 |
-| ctx_pool 传输大消息 | 在 4 MiB 上限内发送大于 2 MiB 的 UTF-8 生成请求，无压缩。直连和经过网关都只生成一次，提示词完整，无 HTTP 回退。一次采样中，CLI 发送 1,048,576、1,048,576、55,871 字节三帧；网关发送 2,153,451 字节的单帧。应用层消息传输通过，出站帧边界与 CLI 有差异。 |
+| ctx_pool 传输大消息 | 在 4 MiB 上限内发送大于 2 MiB 的 UTF-8 生成请求，无压缩。直连和经过网关都只生成一次，假上游收到的最后一条用户消息逐字匹配完整提示词，无 HTTP 回退。等长改写首行的负对照在完整文本断言处失败。一次采样中，CLI 发送 1,048,576、1,048,576、55,871 字节三帧；网关发送 2,153,451 字节的单帧。应用层消息传输通过，出站帧边界与 CLI 有差异。 |
 | 远程压缩 | CLI app-server 发出的手动压缩经 API Key 测试网关进入流式 `POST /v1/responses`，携带 `compaction_trigger`。后续一轮的 `compaction` 项保留了返回的 `id` 和 `encrypted_content`。该用例覆盖 HTTP API Key 路径。 |
 
 WS 增量负对照只在经过网关的连接上扣住第二段文本。直连完成，经过网关的 CLI 未能拼出完整文本，测试按预期失败。
 
 取消回归覆盖以下场景：
 
-- 上游接受取消时，确认与终态可以按任一顺序到达。终态与确认之间的 `codex.response.metadata` 可以送达客户端，后续回合可继续。
-- 上游拒绝有效取消时，客户端收到 `response.interrupt.failed`，连接池废弃本次连接。若网关先收到终态，其用量只记录一次；若先收到拒绝，网关立即结束该轮。两个用例均验证下一次连接重新拨号。
-- 从网关开始向上游写取消请求起，共用一秒期限等待确认与终态。上游确认后迟迟不给终态，或终态后迟迟不给确认，都会触发租约清理。中间的 metadata 和排队的客户端请求不会重置期限。取消期间向下游写入也使用剩余时间。回环 TCP 客户端停止读取大终态帧时，测试验证网关会释放上游租约，已读到的终态用量只记录一次。
+- 确认与 `response.completed` 的两种顺序均有回归。`response.incomplete` 带有 `incomplete_details.reason=interrupted` 时也允许先送终态再等 ACK。`codex.response.metadata`、`responsesapi.websocket_timing` 可以夹在中间。计时通知不会重置已有期限。
+- 上游拒绝有效取消时，下游收到 `response.interrupt.failed`，连接池废弃本次连接。网关先收到终态时，`AfterTurn` 成功回调一次并携带上游用量；先收到拒绝时立即结束该轮。此处观察到服务回调，数据库入账未纳入本组测试。
+- 官方 CLI 的 Drain（追加输入）和 Cancel（主动取消）共用同一种控制帧。带 `turn_id` 的 Responses Lite 请求由客户端执行 Cancel 的一秒期限，网关保留普通上游读超时。这里依赖原生 CLI 执行取消期限，其他客户端仅声明相同元数据但持续保持连接时，释放时间可能超过一秒。真实 CLI 在只收到终态、或只收到 ACK 时都会放弃该 WS，网关随即废弃租约。只有前一种情况收到生成终态并回调其用量。若客户端改为在同一逻辑回合显式链接刚结束的响应，网关按 Drain 续发。没有这个关联信息的排队请求继续等待确认。迟到的旧响应 ACK 不能确认新响应；若归还租约时仍有未决 ACK，池会关闭该连接，下一位借用者重新拨号。
+- 对缺少 Lite 回合标识的请求，网关仍从发送 interrupt 起使用原有的一秒期限，覆盖等待确认、终态和取消期间的写入。下游 TCP 停读造成终态写入超时时，网关释放租约并对已读终态成功回调一次。
 - 网关会拒绝客户端发来的错误或过期 ID。对同一响应重复请求取消，只向上游转发一次。
 
 在 `backend` 目录可重跑 OAuth 对照、流中取消与固定 ID 回归。

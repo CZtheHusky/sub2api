@@ -3,20 +3,15 @@
 package service
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -36,9 +31,13 @@ func TestCodexCLI170OAuthCtxPoolInterrupt(t *testing.T) {
 	upstream := &interruptTestConn{newStagedPassthroughConn()}
 	svc, account, dialer := newInterruptTestService(t, upstream)
 	results := make(chan *OpenAIForwardResult, 2)
-	proxyDone := make(chan error, 1)
+	type downstreamResult struct {
+		err          error
+		cancelEvents []string
+	}
+	proxyDone := make(chan downstreamResult, 1)
 	readLimit := ResolveOpenAIWSClientReadLimitBytes(svc.cfg)
-	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	gateway := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/responses" {
 			t.Errorf("unexpected gateway request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusBadRequest)
@@ -70,82 +69,34 @@ func TestCodexCLI170OAuthCtxPoolInterrupt(t *testing.T) {
 				t.Error("unexpected extra upstream turn")
 			}
 		}}
-		proxyDone <- svc.ProxyResponsesWebSocketFromClient(r.Context(), c, conn, account, account.GetOpenAIAccessToken(), payload, hooks)
+		outcome := downstreamResult{err: svc.ProxyResponsesWebSocketFromClient(r.Context(), c, conn, account, account.GetOpenAIAccessToken(), payload, hooks)}
+		// The app-server JSON-RPC result acknowledges the local request. Check
+		// the separate upstream acknowledgement on the CLI's actual socket.
+		wire := r.Context().Value(codexOAuthWSWireConnKey{}).(*codexOAuthWSWireConn)
+		var message []byte
+		wire.takeDataFrames(func(frame codexOAuthWSWireFrame, payload []byte) {
+			message = append(message, payload...)
+			if frame.final {
+				event := gjson.ParseBytes(message)
+				switch kind := event.Get("type").String(); kind {
+				case "response.interrupt.accepted":
+					outcome.cancelEvents = append(outcome.cancelEvents, kind+":"+event.Get("response_id").String())
+				case "response.completed":
+					if id := event.Get("response.id").String(); id == "resp_generated" {
+						outcome.cancelEvents = append(outcome.cancelEvents, kind+":"+id)
+					}
+				}
+				message = message[:0]
+			}
+		})
+		proxyDone <- outcome
 	}))
+	observeCodexOAuthWSWire(gateway, true)
+	gateway.Start()
 	defer gateway.Close()
 
-	configDir := t.TempDir()
-	catalogPath := filepath.Join(configDir, "models.json")
-	catalog, err := json.Marshal(map[string][]json.RawMessage{"models": {openai.CodexGPT61SolMetadata}})
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(catalogPath, catalog, 0600))
-	config := fmt.Sprintf(`model = %q
-model_provider = "fixture"
-model_catalog_json = %q
-check_for_update_on_startup = false
-[features]
-interrupt_on_cancel = true
-[model_providers.fixture]
-name = "Loopback fixture"
-base_url = %q
-wire_api = "responses"
-env_key = "SUB2API_TEST_TOKEN"
-supports_websockets = true
-request_max_retries = 0
-stream_max_retries = 0
-`, codexOAuthWSSmokeModel, catalogPath, gateway.URL+"/v1")
-	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(config), 0600))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, "app-server", "--listen", "stdio://")
-	cmd.Dir = t.TempDir()
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "CODEX_HOME=" + configDir, "TMPDIR=" + t.TempDir(), "SUB2API_TEST_TOKEN=sk-test"}
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	stdin, err := cmd.StdinPipe()
-	require.NoError(t, err)
-	stdout, err := cmd.StdoutPipe()
-	require.NoError(t, err)
-	require.NoError(t, cmd.Start())
-	defer func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		if t.Failed() {
-			t.Logf("CLI stderr:\n%s", stderr.String())
-		}
-	}()
-
-	encoder, decoder := json.NewEncoder(stdin), json.NewDecoder(stdout)
-	readUntil := func(predicate func(gjson.Result) bool) gjson.Result {
-		for {
-			var raw json.RawMessage
-			require.NoError(t, decoder.Decode(&raw), "waiting for app-server event")
-			message := gjson.ParseBytes(raw)
-			require.NotEqual(t, "error", message.Get("method").String(), "%s", message.Raw)
-			if predicate(message) {
-				return message
-			}
-		}
-	}
-	send := func(id int64, method string, params map[string]any) {
-		require.NoError(t, encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-	}
-	call := func(id int64, method string, params map[string]any) gjson.Result {
-		send(id, method, params)
-		reply := readUntil(func(message gjson.Result) bool { return message.Get("id").Int() == id })
-		require.True(t, reply.Get("result").Exists(), "%s: %s", method, reply.Raw)
-		return reply.Get("result")
-	}
-	call(1, "initialize", map[string]any{"clientInfo": map[string]string{"name": "sub2api-loopback", "version": "1.0.0"}})
-	require.NoError(t, encoder.Encode(map[string]string{"jsonrpc": "2.0", "method": "initialized"}))
-	thread := call(2, "thread/start", map[string]any{"cwd": cmd.Dir, "ephemeral": true}).Get("thread.id").String()
-	require.NotEmpty(t, thread)
-	turn := call(3, "turn/start", map[string]any{
-		"threadId": thread,
-		"input":    []map[string]string{{"type": "text", "text": "Generate a response we can interrupt"}},
-	}).Get("turn.id").String()
-	require.NotEmpty(t, turn)
+	app := startCodexCLI170ResponsesLiteAppServer(t, binary, gateway.URL)
+	ctx, stdin, send, readUntil, thread, turn := app.ctx, app.stdin, app.send, app.readUntil, app.thread, app.turn
 
 	warmup := requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, 5*time.Second)
 	require.Equal(t, "false", gjson.GetBytes(warmup, "generate").Raw)
@@ -168,14 +119,14 @@ stream_max_retries = 0
 	upstream.Send(`{"type":"response.interrupt.accepted","response_id":"resp_generated"}`)
 	upstream.Send(`{"type":"response.completed","response":{"id":"resp_generated","status":"completed","output":[],"usage":{"input_tokens":11,"output_tokens":2}}}`)
 
-	var acknowledged, interrupted bool
-	for !acknowledged || !interrupted {
+	var interruptReplied, interrupted bool
+	for !interruptReplied || !interrupted {
 		message := readUntil(func(message gjson.Result) bool {
 			return message.Get("id").Int() == 4 || message.Get("method").String() == "turn/completed"
 		})
 		if message.Get("id").Int() == 4 {
 			require.True(t, message.Get("result").Exists(), "%s", message.Raw)
-			acknowledged = true
+			interruptReplied = true
 		} else {
 			require.Equal(t, turn, message.Get("params.turn.id").String())
 			require.Equal(t, "interrupted", message.Get("params.turn.status").String())
@@ -201,8 +152,10 @@ stream_max_retries = 0
 	}
 	require.NoError(t, stdin.Close())
 	select {
-	case err := <-proxyDone:
-		require.NoError(t, err)
+	case outcome := <-proxyDone:
+		require.NoError(t, outcome.err)
+		require.Equal(t, []string{"response.interrupt.accepted:resp_generated", "response.completed:resp_generated"}, outcome.cancelEvents,
+			"the gateway must write the upstream acknowledgement and terminal to the CLI socket")
 	case <-ctx.Done():
 		t.Fatal("gateway did not close the session after the CLI exited")
 	}

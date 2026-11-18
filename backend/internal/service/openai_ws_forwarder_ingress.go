@@ -988,7 +988,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 	}
 	var rejectedFieldRetryState *openAIResponsesRejectedFieldRetryState
-	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
+	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload, clientPayload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
 		responseModelObserver := &upstreamResponseModelObserver{}
 		if lease == nil {
 			return nil, errors.New("upstream websocket lease is nil")
@@ -1014,9 +1014,19 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 		responseID := ""
 		interruptTurn := openAIWSInterruptTurn{}
+		if interruptReader != nil && isOpenAIResponsesLiteWebSocketPayload(clientPayload) {
+			interruptTurn.liteTurnID = gjson.GetBytes(clientPayload, "client_metadata.turn_id").Str
+		}
 		writeTurnMessage := func(message []byte) error {
 			if interruptTurn.cancelDeadline.IsZero() {
 				return writeClientMessage(message)
+			}
+			if interruptTurn.liteTurnID != "" {
+				err := writeClientWithTimeout(message, min(openAIWSInterruptTimeout, s.openAIWSWriteTimeout()))
+				if errors.Is(err, context.DeadlineExceeded) {
+					return errOpenAIWSInterruptTimeout
+				}
+				return err
 			}
 			remaining := time.Until(interruptTurn.cancelDeadline)
 			if remaining <= 0 {
@@ -1063,6 +1073,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if interruptReader != nil && interruptTurn.responseID != "" {
 				upstreamMessage, readErr = interruptReader.readUpstream(lease, &interruptTurn, s.openAIWSReadTimeout(), s.openAIWSWriteTimeout(), writeTurnMessage)
 				clientDisconnected = clientDisconnected || !interruptReader.drainDeadline.IsZero()
+			} else if interruptReader != nil {
+				upstreamMessage, readErr = interruptReader.readFirst(lease, s.openAIWSReadTimeout())
 			} else {
 				upstreamMessage, readErr = lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
 			}
@@ -1088,6 +1100,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 			eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
 			if interruptReader != nil {
+				if interruptReader.consumeDrainedAck(lease, eventType, upstreamMessage) {
+					continue
+				}
 				if err := interruptTurn.recordAck(eventType, upstreamMessage); err != nil {
 					lease.abort()
 					return nil, err
@@ -1297,7 +1312,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			if isTerminalEvent {
 				if interruptionErr == nil && interruptTurn.awaitingAck {
-					if !clientDisconnected && (eventType == "response.completed" || eventType == "response.done") {
+					terminalCompletesInterrupt := eventType == "response.completed" || eventType == "response.done" ||
+						(eventType == "response.incomplete" && gjson.GetBytes(upstreamMessage, "response.incomplete_details.reason").String() == "interrupted")
+					if !clientDisconnected && terminalCompletesInterrupt {
 						interruptionErr = interruptReader.finishTurn(lease, &interruptTurn, s.openAIWSReadTimeout(), s.openAIWSWriteTimeout(), writeTurnMessage)
 					}
 					if interruptTurn.awaitingAck || interruptionErr != nil {
@@ -1426,6 +1443,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if sessionLease == nil {
 			return
 		}
+		if interruptReader != nil {
+			interruptReader.releaseLease(sessionLease)
+		}
 		if !lastTurnClean {
 			sessionLease.MarkBroken()
 		}
@@ -1476,7 +1496,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			return
 		}
 		if markBroken {
-			sessionLease.MarkBroken()
+			lastTurnClean = false
 		}
 		releaseSessionLease()
 		sessionLease = nil
@@ -1947,7 +1967,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 
-		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
+		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentClientPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
 		if relayErr != nil {
 			lastTurnClean = false
 			if result != nil {

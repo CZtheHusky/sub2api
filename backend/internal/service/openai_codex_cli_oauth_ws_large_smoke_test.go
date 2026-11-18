@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,7 +68,7 @@ func TestCodexCLI170OAuthWebSocketLargeMessage(t *testing.T) {
 				return
 			}
 			select {
-			case messages <- upstreamMessage{payload: payload, frames: wire.takeDataFrames()}:
+			case messages <- upstreamMessage{payload: payload, frames: wire.takeDataFrames(nil)}:
 			case <-ctx.Done():
 				return
 			}
@@ -79,10 +80,7 @@ func TestCodexCLI170OAuthWebSocketLargeMessage(t *testing.T) {
 			}
 		}
 	}))
-	upstream.Listener = codexOAuthWSWireListener{Listener: upstream.Listener}
-	upstream.Config.ConnContext = func(ctx context.Context, conn net.Conn) context.Context {
-		return context.WithValue(ctx, codexOAuthWSWireConnKey{}, conn)
-	}
+	observeCodexOAuthWSWire(upstream, false)
 	upstream.Start()
 	defer upstream.Close()
 
@@ -138,7 +136,11 @@ func TestCodexCLI170OAuthWebSocketLargeMessage(t *testing.T) {
 		require.Equal(t, "response.create", gjson.GetBytes(generation.payload, "type").String())
 		require.Greater(t, len(generation.payload), 2*mebibyte)
 		require.Less(t, len(generation.payload), ingressLimit)
-		require.True(t, bytes.Contains(generation.payload, []byte(strings.TrimPrefix(prompt, codexOAuthWSSmokePrompt+"\n"))), "upstream must receive the full prompt")
+		userItems := gjson.GetBytes(generation.payload, `input.#(role=="user")#`).Array()
+		require.NotEmpty(t, userItems, "generation must include the user's input")
+		// The CLI emits environment context as an earlier user message.
+		userText := userItems[len(userItems)-1].Get(`content.#(type=="input_text").text`).String()
+		require.True(t, userText == prompt, "upstream user text must match the full prompt for %s (got %d bytes, want %d)", baseURL, len(userText), len(prompt))
 		var frameBytes int
 		for i, frame := range generation.frames {
 			frameBytes += frame.length
@@ -199,24 +201,51 @@ stream_max_retries = 1
 
 type codexOAuthWSWireConnKey struct{}
 
-type codexOAuthWSWireListener struct{ net.Listener }
+func observeCodexOAuthWSWire(server *httptest.Server, captureServerWrites bool) {
+	server.Listener = codexOAuthWSWireListener{Listener: server.Listener, captureServerWrites: captureServerWrites}
+	server.Config.ConnContext = func(ctx context.Context, conn net.Conn) context.Context {
+		return context.WithValue(ctx, codexOAuthWSWireConnKey{}, conn)
+	}
+}
+
+type codexOAuthWSWireListener struct {
+	net.Listener
+	captureServerWrites bool
+}
 
 func (l codexOAuthWSWireListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
-	return &codexOAuthWSWireConn{Conn: conn}, nil
+	return &codexOAuthWSWireConn{Conn: conn, captureServerWrites: l.captureServerWrites}, nil
 }
 
 type codexOAuthWSWireConn struct {
 	net.Conn
-	wire              bytes.Buffer
-	handshakeConsumed bool
+	captureServerWrites bool
+	mu                  sync.Mutex
+	wire                bytes.Buffer
+	handshakeConsumed   bool
 }
 
 func (c *codexOAuthWSWireConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
+	if !c.captureServerWrites {
+		c.mu.Lock()
+		c.wire.Write(p[:n])
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *codexOAuthWSWireConn) Write(p []byte) (int, error) {
+	if !c.captureServerWrites {
+		return c.Conn.Write(p)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n, err := c.Conn.Write(p)
 	c.wire.Write(p[:n])
 	return n, err
 }
@@ -227,7 +256,9 @@ type codexOAuthWSWireFrame struct {
 	final  bool
 }
 
-func (c *codexOAuthWSWireConn) takeDataFrames() []codexOAuthWSWireFrame {
+func (c *codexOAuthWSWireConn) takeDataFrames(observeServerFrame func(codexOAuthWSWireFrame, []byte)) []codexOAuthWSWireFrame {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.handshakeConsumed {
 		handshakeEnd := bytes.Index(c.wire.Bytes(), []byte("\r\n\r\n"))
 		if handshakeEnd < 0 {
@@ -259,7 +290,11 @@ func (c *codexOAuthWSWireConn) takeDataFrames() []codexOAuthWSWireFrame {
 		}
 		opcode := data[0] & 0xf
 		if opcode < 8 {
-			frames = append(frames, codexOAuthWSWireFrame{length: length, opcode: opcode, final: data[0]&0x80 != 0})
+			frame := codexOAuthWSWireFrame{length: length, opcode: opcode, final: data[0]&0x80 != 0}
+			frames = append(frames, frame)
+			if observeServerFrame != nil && c.captureServerWrites {
+				observeServerFrame(frame, data[header:header+length])
+			}
 		}
 		c.wire.Next(header + length)
 	}
