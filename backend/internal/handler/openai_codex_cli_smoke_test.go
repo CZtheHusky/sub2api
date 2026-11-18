@@ -9,9 +9,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,9 +46,9 @@ func TestCodexCLIResponsesSmoke(t *testing.T) {
 	if binary == "" {
 		t.Skip("set SUB2API_CODEX_SMOKE_BINARY to a Codex executable to run this test")
 	}
-	version, err := exec.Command(binary, "--version").CombinedOutput()
-	require.NoError(t, err, "%s", version)
-	t.Logf("%s", strings.TrimSpace(string(version)))
+	version, err := exec.Command(binary, "--version").Output()
+	require.NoError(t, err)
+	require.Equal(t, "codex-cli 0.170.0", strings.TrimSpace(string(version)))
 	gin.SetMode(gin.TestMode)
 	for _, tc := range []struct {
 		name                string
@@ -119,13 +122,33 @@ func TestCodexCLIResponsesSmoke(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			gateway := newCodexSmokeGateway(t, upstream.URL, tc.readLimit, service.OpenAIWSIngressModePassthrough)
+			gateway := newCodexSmokeGateway(t, upstream.URL, 0, service.OpenAIWSIngressModePassthrough)
 			defer gateway.Close()
+			clientURL := gateway.URL
 			prompt := smokePrompt
 			if tc.readLimit != 0 {
+				// Advertise a smaller limit than the gateway enforces. If the CLI
+				// sends the generation over WS, the upstream will actually receive it.
+				target, err := url.Parse(gateway.URL)
+				require.NoError(t, err)
+				proxy := httputil.NewSingleHostReverseProxy(target)
+				proxy.ModifyResponse = func(resp *http.Response) error {
+					if resp.StatusCode == http.StatusSwitchingProtocols {
+						const header = "X-Codex-WebSocket-Max-Message-Bytes"
+						actual, err := strconv.ParseInt(resp.Header.Get(header), 10, 64)
+						if err != nil || actual <= tc.readLimit {
+							return fmt.Errorf("unexpected gateway WS limit %q", resp.Header.Get(header))
+						}
+						resp.Header.Set(header, strconv.FormatInt(tc.readLimit, 10))
+					}
+					return nil
+				}
+				front := httptest.NewServer(proxy)
+				defer front.Close()
+				clientURL = front.URL
 				prompt += strings.Repeat(" test", int(tc.readLimit)/4)
 			}
-			output := runCodexSmokeCLI(t, binary, gateway.URL, tc.useWS, prompt)
+			output := runCodexSmokeCLI(t, binary, clientURL, tc.useWS, prompt)
 			var completed, answered bool
 			for line := range strings.SplitSeq(output, "\n") {
 				switch gjson.Get(line, "type").String() {
@@ -166,7 +189,6 @@ func TestCodexCLIResponsesSmoke(t *testing.T) {
 			require.Equal(t, 1, generations, "expected exactly one generation request")
 			if tc.readLimit != 0 {
 				require.Equal(t, 1, warmups, "WebSocket warmup must fit within the advertised limit")
-				require.NotContains(t, output, "stream disconnected before completion", "fallback must happen before sending the oversized frame")
 			}
 			if tc.rejectWebSocketTurn {
 				require.Equal(t, 1, warmups, "WebSocket must complete the warmup without retrying it")

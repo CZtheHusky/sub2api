@@ -649,6 +649,13 @@ func runUpstreamToClient(
 			beforeClientWrite(msgType, payload)
 		}
 		writeErr := writeClient(msgType, payload)
+		if writeErr == nil {
+			wroteDownstream = true
+			if state != nil {
+				// The terminal write hook can admit the next turn and reset this flag.
+				state.turnWroteDownstream.Store(true)
+			}
+		}
 		if afterClientWrite != nil {
 			afterClientWrite(msgType, payload, writeErr)
 		}
@@ -663,10 +670,6 @@ func runUpstreamToClient(
 			})
 			exitCh <- relayExitSignal{stage: "write_client", err: writeErr, wroteDownstream: wroteDownstream}
 			return
-		}
-		wroteDownstream = true
-		if state != nil {
-			state.turnWroteDownstream.Store(true)
 		}
 		if afterWriteClient != nil {
 			afterWriteClient(msgType, payload)
