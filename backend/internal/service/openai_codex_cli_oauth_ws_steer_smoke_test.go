@@ -46,14 +46,26 @@ func TestCodexCLI170OAuthCtxPoolSteeringAfterEffortChange(t *testing.T) {
 	testCodexCLI170OAuthCtxPoolSteering(t, "changed effort")
 }
 
+func TestCodexCLI170OAuthCtxPoolSteeringAfterToolResult(t *testing.T) {
+	testCodexCLI170OAuthCtxPoolSteering(t, "tool then changed effort")
+}
+
 func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, scenario string) {
 	t.Helper()
 	binary := requireCodexCLI170ResponsesLiteBinary(t)
 	server, upstream, dialer, results, proxyDone := startCodexCLI170OAuthCtxPoolSmokeGateway(t)
 	app := startCodexCLI170ResponsesLiteAppServer(t, binary, server.URL)
-	firstEvents := startCodexCLI170ResponsesLiteGeneration(t, app, upstream)
+	startCodexCLI170GenerationRequest(t, app, upstream)
+	responseIDs := []string{"resp_warmup"}
+	var toolOutput string
+	if scenario == "tool then changed effort" {
+		toolOutput = completeCodexCLI170ToolCall(t, upstream)
+		responseIDs = append(responseIDs, "resp_tool")
+	}
+	firstEvents := startCodexCLI170TextStream(t, app, upstream)
+	changedEffort := scenario == "changed effort" || scenario == "tool then changed effort"
 
-	if scenario == "changed effort" {
+	if changedEffort {
 		app.call(5, "turn/settings/update", map[string]any{"threadId": app.thread, "turnId": app.turn, "effort": "high"})
 	}
 	const steeringText = "Continue with this steering detail"
@@ -87,15 +99,33 @@ func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, scenario string) {
 	previous := gjson.GetBytes(followUp, "previous_response_id")
 	require.Equal(t, app.turn, gjson.GetBytes(followUp, "client_metadata.turn_id").String())
 	input := gjson.GetBytes(followUp, "input").Array()
-	if scenario == "changed effort" {
+	require.NotEmpty(t, input)
+	if changedEffort {
 		require.False(t, previous.Exists())
 		require.Equal(t, "high", gjson.GetBytes(followUp, "reasoning.effort").String())
-		require.Contains(t, gjson.GetBytes(followUp, "input").Raw, "Generate a response we can interrupt")
+		var foundOriginal, foundOutput bool
+		for _, item := range input[:len(input)-1] {
+			if item.Get("type").Str == "message" && item.Get("role").Str == "user" {
+				for _, content := range item.Get("content").Array() {
+					if content.Get("text").Str == "Generate a response we can interrupt" {
+						foundOriginal = true
+					}
+				}
+			}
+			if item.Get("type").Str == "function_call_output" && item.Get("call_id").Str == "call_tool" {
+				require.True(t, foundOriginal)
+				require.Equal(t, toolOutput, item.Get("output").Str)
+				foundOutput = true
+			}
+		}
+		require.True(t, foundOriginal)
+		if toolOutput != "" {
+			require.True(t, foundOutput, "the full continuation must preserve the tool result")
+		}
 	} else {
 		require.Equal(t, "resp_generated", previous.String())
 		require.Len(t, input, 1, "the continuation carries only the new steering input")
 	}
-	require.NotEmpty(t, input)
 	last := input[len(input)-1]
 	require.Equal(t, "message", last.Get("type").String())
 	require.Equal(t, "user", last.Get("role").String())
@@ -108,7 +138,7 @@ func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, scenario string) {
 	require.Equal(t, app.turn, finished.Get("params.turn.id").String())
 	require.Equal(t, "completed", finished.Get("params.turn.status").String())
 
-	for i, responseID := range []string{"resp_warmup", "resp_generated", "resp_steered"} {
+	for i, responseID := range append(responseIDs, "resp_generated", "resp_steered") {
 		select {
 		case outcome := <-results:
 			require.Equal(t, i+1, outcome.turn)
@@ -244,7 +274,7 @@ func startCodexCLI170OAuthCtxPoolSmokeGateway(t *testing.T) (*httptest.Server, *
 	gin.SetMode(gin.TestMode)
 	upstream := &interruptTestConn{newStagedPassthroughConn()}
 	svc, account, dialer := newInterruptTestService(t, upstream)
-	results := make(chan codexCLI170TurnOutcome, 3)
+	results := make(chan codexCLI170TurnOutcome, 4)
 	proxyDone := make(chan error, 1)
 	readLimit := ResolveOpenAIWSClientReadLimitBytes(svc.cfg)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -283,6 +313,30 @@ func startCodexCLI170OAuthCtxPoolSmokeGateway(t *testing.T) (*httptest.Server, *
 
 func startCodexCLI170ResponsesLiteGeneration(t *testing.T, app codexCLI170ResponsesLiteAppServer, upstream *interruptTestConn) []string {
 	t.Helper()
+	startCodexCLI170GenerationRequest(t, app, upstream)
+	return startCodexCLI170TextStream(t, app, upstream)
+}
+
+func completeCodexCLI170ToolCall(t *testing.T, upstream *interruptTestConn) string {
+	t.Helper()
+	const item = `{"type":"function_call","id":"fc_tool","call_id":"call_tool","namespace":"functions","name":"exec_command","arguments":"{\"cmd\":\"echo CODEX_TOOL_OK\"}","status":"completed"}`
+	upstream.Send(strings.ReplaceAll(codexOAuthWSSmokeEvents(true)[0], "resp_generated", "resp_tool"))
+	upstream.Send(`{"type":"response.output_item.added","output_index":0,"item":` + item + `}`)
+	upstream.Send(`{"type":"response.output_item.done","output_index":0,"item":` + item + `}`)
+	upstream.Send(`{"type":"response.completed","response":{"id":"resp_tool","status":"completed","output":[` + item + `],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+	next := requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, 5*time.Second)
+	require.Equal(t, "resp_tool", gjson.GetBytes(next, "previous_response_id").Str)
+	items := gjson.GetBytes(next, "input").Array()
+	require.Len(t, items, 1)
+	require.Equal(t, "function_call_output", items[0].Get("type").Str)
+	require.Equal(t, "call_tool", items[0].Get("call_id").Str)
+	output := items[0].Get("output").Str
+	require.Contains(t, output, "CODEX_TOOL_OK")
+	return output
+}
+
+func startCodexCLI170GenerationRequest(t *testing.T, app codexCLI170ResponsesLiteAppServer, upstream *interruptTestConn) {
+	t.Helper()
 	warmup := requirePassthroughUpstreamWrite(t, upstream.stagedPassthroughConn, 5*time.Second)
 	require.Equal(t, "false", gjson.GetBytes(warmup, "generate").Raw)
 	for _, event := range codexOAuthWSSmokeEvents(false) {
@@ -293,6 +347,10 @@ func startCodexCLI170ResponsesLiteGeneration(t *testing.T, app codexCLI170Respon
 	require.Equal(t, "resp_warmup", gjson.GetBytes(create, "previous_response_id").String())
 	require.Equal(t, "true", gjson.GetBytes(create, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").String())
 	require.Equal(t, app.turn, gjson.GetBytes(create, "client_metadata.turn_id").String())
+}
+
+func startCodexCLI170TextStream(t *testing.T, app codexCLI170ResponsesLiteAppServer, upstream *interruptTestConn) []string {
+	t.Helper()
 	events := codexOAuthWSSmokeEvents(true)
 	for _, event := range events[:3] {
 		upstream.Send(event)

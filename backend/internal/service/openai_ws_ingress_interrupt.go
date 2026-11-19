@@ -55,6 +55,7 @@ var errOpenAIWSDrainContinued = errors.New("client continued the drained respons
 
 type openAIWSInterruptTurn struct {
 	clientPayload  []byte
+	replayInput    []json.RawMessage
 	liteTurnID     string
 	liteRejected   bool
 	terminalSeen   bool
@@ -110,12 +111,26 @@ func (t *openAIWSInterruptTurn) continues(queued *openAIWSClientReadResult) bool
 	// steering input instead of referencing the completed response.
 	const userContents = `input.#(role=="user")#.content`
 	previous := gjson.GetBytes(t.clientPayload, userContents).Array()
-	if len(previous) == 0 {
+	var lastUser gjson.Result
+	if len(previous) > 0 {
+		lastUser = previous[len(previous)-1]
+	} else {
+		// A tool-only delta has no user item. The linked replay input already
+		// contains the user message from before the tool call.
+		for i := len(t.replayInput) - 1; i >= 0; i-- {
+			item := t.replayInput[i]
+			if gjson.GetBytes(item, "role").Str == "user" {
+				lastUser = gjson.GetBytes(item, "content")
+				break
+			}
+		}
+	}
+	if !lastUser.Exists() {
 		return false
 	}
 	items := gjson.GetBytes(queued.payload, userContents).Array()
 	for i := 1; i < len(items); i++ {
-		if items[i-1].Raw == previous[len(previous)-1].Raw {
+		if items[i-1].Raw == lastUser.Raw {
 			return true
 		}
 	}

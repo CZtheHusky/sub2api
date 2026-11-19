@@ -988,7 +988,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 	}
 	var rejectedFieldRetryState *openAIResponsesRejectedFieldRetryState
-	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload, clientPayload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
+	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload, clientPayload []byte, replayInput []json.RawMessage, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
 		responseModelObserver := &upstreamResponseModelObserver{}
 		if lease == nil {
 			return nil, errors.New("upstream websocket lease is nil")
@@ -1016,6 +1016,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		interruptTurn := openAIWSInterruptTurn{}
 		if interruptReader != nil && isOpenAIResponsesLiteWebSocketPayload(clientPayload) {
 			interruptTurn.clientPayload = clientPayload
+			interruptTurn.replayInput = replayInput
 			interruptTurn.liteTurnID = gjson.GetBytes(clientPayload, "client_metadata.turn_id").Str
 		}
 		writeTurnMessage := func(message []byte) error {
@@ -1969,7 +1970,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 
-		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentClientPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
+		var linkedInput []json.RawMessage
+		if currentTurnReplayInputComplete {
+			linkedInput = currentTurnReplayInput
+		}
+		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentClientPayload, linkedInput, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
 		if relayErr != nil {
 			lastTurnClean = false
 			if result != nil {
