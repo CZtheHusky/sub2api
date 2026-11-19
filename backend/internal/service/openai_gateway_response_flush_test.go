@@ -458,6 +458,39 @@ func TestOpenAIResponseFlush_BareErrorFollowedByCompletedUsesCompletedTerminal(t
 	require.Contains(t, gotBody, `"type":"response.completed"`)
 }
 
+func TestOpenAIResponseFlush_BareErrorThenResumedAnswer(t *testing.T) {
+	const added = `data: {"type":"response.output_item.added","item":{"type":"message","role":"assistant","id":"msg1","content":[]}}`
+	const delta = `data: {"type":"response.output_text.delta","item_id":"msg1","delta":"Recovered answer"}`
+	const done = `data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","id":"msg1","content":[{"type":"output_text","text":"Recovered answer"}]}}`
+	body := `data: {"type":"error","error":{"code":"transient","message":"retrying"}}` + "\n\n" +
+		"event: response.output_item.added\n" + added + "\n\n" +
+		delta + "\n\n" + done + "\n\n"
+	for _, tc := range []struct {
+		name      string
+		terminal  string
+		wantEvent string
+	}{
+		{"completed", `data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}`, "response.completed"},
+		{"EOF", "", "response.failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := newOpenAIResponseFlushRecorder()
+			result, err := runOpenAIResponseFlushTest(recorder, io.NopCloser(strings.NewReader(body+tc.terminal+"\n\n")), config.GatewayConfig{})
+			if tc.terminal == "" {
+				require.ErrorContains(t, err, "retrying")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, 7, result.usage.InputTokens)
+				require.Equal(t, 3, result.usage.OutputTokens)
+			}
+			downstream, _ := recorder.snapshot()
+			require.Contains(t, downstream, "event: response.output_item.added\n"+added+"\n\n"+delta+"\n\n"+done+"\n\n")
+			require.Contains(t, downstream, `"type":"`+tc.wantEvent+`"`)
+			require.NotContains(t, downstream, `"type":"error"`)
+		})
+	}
+}
+
 func TestOpenAIResponseFlush_BareErrorFollowedByIncompleteKeepsSnapshot(t *testing.T) {
 	body := `data: {"type":"error","error":{"code":"transient","message":"retrying"}}
 

@@ -507,6 +507,14 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	supersedesBareError := func(eventType string) bool {
 		return eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete"
 	}
+	// A bare error is provisional. Relay resumed output while retaining the
+	// error for EOF or timeout until the upstream sends a response terminal.
+	suppressWhileAwaitingTerminal := func(eventType string) bool {
+		if !sawBareError || sawResponseFailed || supersedesBareError(eventType) || eventType == "response.failed" {
+			return false
+		}
+		return !strings.HasPrefix(eventType, "response.") || openAIStreamEventIsMetadata(eventType) || openAIStreamEventTypeIsTerminal(eventType)
+	}
 	processSSELine := func(line string, queueDrained bool) {
 		if streamEarlyErr != nil {
 			return
@@ -514,7 +522,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if eventType, ok := extractOpenAISSEEventLine(line); ok {
 			pendingSSEEventType = eventType
 			eventType = strings.TrimSpace(eventType)
-			suppressCurrentEvent = codexFailureTerminal && (eventType == "error" || (sawBareError && !sawResponseFailed && eventType != "response.failed" && !supersedesBareError(eventType)))
+			suppressCurrentEvent = codexFailureTerminal && (eventType == "error" || suppressWhileAwaitingTerminal(eventType))
 			if forwardsKeepaliveDirect(eventType) {
 				keepaliveEventDirect = true
 				eventInProgress = true
@@ -544,7 +552,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				bareErrorAccountSideEffectsPending = false
 				failedMessage = ""
 			}
-			if codexFailureTerminal && sawBareError && !sawResponseFailed && eventType != "response.failed" {
+			if suppressWhileAwaitingTerminal(eventType) {
 				suppressCurrentEvent = true
 			}
 			observer.ObserveOpenAI(dataBytes, eventType)

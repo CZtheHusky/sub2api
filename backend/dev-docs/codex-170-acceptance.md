@@ -47,6 +47,7 @@ go test -tags=unit ./internal/service/openai_ws_v2 -run '^TestRelay_UpstreamMess
 | 场景 | 观测与结论 |
 | --- | --- |
 | HTTP 常规 OAuth 和透传 | 对同一次 CLI 请求核对模型、输入、工具声明和流式参数。常规 OAuth 的 SSE 送回真实 CLI；透传模式的答案和终态由 Go 响应记录器核对。6.1 Sol 默认使用输入中的 `additional_tools`，5.4 样例使用顶层工具。客户端省略顶层 `instructions`，将指令放在 developer 消息中。常规 OAuth 原先额外合成默认指令，已修复；两种模式和两种样例均通过。 |
+| 普通 OAuth HTTP 临时错误后恢复生成 | 真实 CLI 直连假上游和经过网关，分别对照有无临时错误的生成流。四组均收到相同的答案并报告回合完成及用量。网关在等待最终状态时转发恢复生成的文本和消息完成事件；若上游随后断流，已收到的输出之后仍会送达失败终态。 |
 | HTTP 出站差异 | 采样日志中 CLI exec 和网关的 User-Agent 不同。两个网关转发模式均断言出站 `Version: 0.170.0`、JSON 内容类型和 SSE 接收类型。OAuth 还会规范化 `additional_tools` 声明 ID 的 UUID 拼写。 |
 | WS OAuth passthrough | 对照直连和经网关的两次 CLI 运行。各收到一次预热和一次生成，二者均通过 `previous_response_id` 引用预热响应。比较 `type`、`model`、`stream`、`generate`、`previous_response_id`、`instructions`、`tools`、`tool_choice`、`parallel_tool_calls`、`reasoning`、`include`、`store`、`text`、`service_tier`、`prompt_cache_options` 的存在性和值。输入逐项比较内容和 ID 类型前缀。假上游在 CLI 通过增量事件读到完整文本后，才发送含完整答案的完成事件。 |
 | OAuth ctx_pool 生成中取消 | 真实 0.170.0 app-server 在支持 Responses Lite 的模型上显式启用 `interrupt_on_cancel`，收到部分文本后取消。在假上游发送终态前，网关通过本轮原租约转发匹配 response ID 的 interrupt。在通往 CLI 的 WS 上捕获到匹配的 ACK 和终态，app-server 报告回合为 `interrupted`，网关回调报告终态用量。扣掉下行 ACK 的负对照在 WS 断言处失败。该 CLI 功能默认关闭。 |
@@ -71,7 +72,7 @@ WS 增量负对照只在经过网关的连接上扣住第二段文本。直连�
 从 `backend` 目录可单独复跑 HTTP 部分输出快照与 OAuth 缓存 TTL 回归。
 
 ```sh
-go test -tags=unit ./internal/service -run '^Test(NormalizeResponsesStreamingTerminalOutputPreservesIncompleteSnapshot|OpenAIResponseFlush_BareErrorFollowedByIncompleteKeepsSnapshot|OpenAIGatewayService_CodexOAuthPreservesTurnCacheTTL)$' -count=1
+go test -tags=unit ./internal/service -run '^Test(NormalizeResponsesStreamingTerminalOutputPreservesIncompleteSnapshot|OpenAIResponseFlush_BareErrorThenResumedAnswer|OpenAIResponseFlush_BareErrorFollowedByIncompleteKeepsSnapshot|OpenAIGatewayService_CodexOAuthPreservesTurnCacheTTL)$' -count=1
 ```
 
 在 `backend` 目录可重跑 OAuth 对照、流中取消与固定 ID 回归。
