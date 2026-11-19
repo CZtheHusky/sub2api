@@ -103,7 +103,7 @@ func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, scenario string) {
 	if changedEffort {
 		require.False(t, previous.Exists())
 		require.Equal(t, "high", gjson.GetBytes(followUp, "reasoning.effort").String())
-		var foundOriginal, foundOutput bool
+		var foundOriginal, foundCall, foundOutput bool
 		for _, item := range input[:len(input)-1] {
 			if item.Get("type").Str == "message" && item.Get("role").Str == "user" {
 				for _, content := range item.Get("content").Array() {
@@ -112,8 +112,13 @@ func testCodexCLI170OAuthCtxPoolSteering(t *testing.T, scenario string) {
 					}
 				}
 			}
-			if item.Get("type").Str == "function_call_output" && item.Get("call_id").Str == "call_tool" {
+			if item.Get("type").Str == "function_call" && item.Get("call_id").Str == "call_tool" {
 				require.True(t, foundOriginal)
+				require.Equal(t, "exec_command", item.Get("name").Str)
+				foundCall = true
+			}
+			if item.Get("type").Str == "function_call_output" && item.Get("call_id").Str == "call_tool" {
+				require.True(t, foundCall, "tool output must follow its matching call")
 				require.Equal(t, toolOutput, item.Get("output").Str)
 				foundOutput = true
 			}

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -129,8 +130,17 @@ func (t *openAIWSInterruptTurn) continues(queued *openAIWSClientReadResult) bool
 		return false
 	}
 	items := gjson.GetBytes(queued.payload, userContents).Array()
+	var normalizedUser []byte
 	for i := 1; i < len(items); i++ {
-		if items[i-1].Raw == lastUser.Raw {
+		candidate := items[i-1].Raw
+		if candidate == lastUser.Raw {
+			return true
+		}
+		// Gateway schema rewrites may reserialize the replayed user content.
+		if normalizedUser == nil {
+			normalizedUser = normalizeOpenAIWSJSONForCompareOrRaw([]byte(lastUser.Raw))
+		}
+		if bytes.Equal(normalizedUser, normalizeOpenAIWSJSONForCompareOrRaw([]byte(candidate))) {
 			return true
 		}
 	}

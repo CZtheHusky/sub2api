@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -218,5 +220,21 @@ func TestOpenAIWSOAuthCtxPoolInterruptContinuationGetsFreshReadTimeout(t *testin
 				t.Fatal("gateway did not finish the timed out turn")
 			}
 		})
+	}
+}
+
+func TestOpenAIWSOAuthCtxPoolInterruptFullContinuationAfterReplayReserialization(t *testing.T) {
+	turn := openAIWSInterruptTurn{liteTurnID: "turn", replayInput: []json.RawMessage{
+		json.RawMessage(`{"role":"user","content":[{"text":"first","type":"input_text"},{"text":"second","type":"input_text"}]}`),
+	}}
+	for _, tc := range []struct {
+		first, second string
+		continues     bool
+	}{
+		{"first", "second", true},
+		{"second", "first", false},
+	} {
+		payload := fmt.Sprintf(`{"type":"response.create","client_metadata":{"turn_id":"turn"},"input":[{"role":"user","content":[{"type":"input_text","text":%q},{"type":"input_text","text":%q}]},{"role":"user","content":[{"type":"input_text","text":"continue"}]}]}`, tc.first, tc.second)
+		require.Equal(t, tc.continues, turn.continues(&openAIWSClientReadResult{payload: []byte(payload)}))
 	}
 }

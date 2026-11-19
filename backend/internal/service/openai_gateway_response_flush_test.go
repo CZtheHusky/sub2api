@@ -458,6 +458,26 @@ func TestOpenAIResponseFlush_BareErrorFollowedByCompletedUsesCompletedTerminal(t
 	require.Contains(t, gotBody, `"type":"response.completed"`)
 }
 
+func TestOpenAIResponseFlush_BareErrorFollowedByIncompleteKeepsSnapshot(t *testing.T) {
+	body := `data: {"type":"error","error":{"code":"transient","message":"retrying"}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_partial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}],"usage":{"input_tokens":7,"output_tokens":3}}}
+
+`
+	recorder := newOpenAIResponseFlushRecorder()
+	result, err := runOpenAIResponseFlushTest(recorder, io.NopCloser(strings.NewReader(body)), config.GatewayConfig{})
+	require.NoError(t, err)
+	require.Equal(t, 7, result.usage.InputTokens)
+	require.Equal(t, 3, result.usage.OutputTokens)
+	downstream, _ := recorder.snapshot()
+	require.Contains(t, downstream, "event: response.incomplete\n")
+	require.Contains(t, downstream, `"reason":"max_output_tokens"`)
+	require.Contains(t, downstream, `"text":"partial answer"`)
+	require.NotContains(t, downstream, "retrying")
+	require.NotContains(t, downstream, "response.failed")
+}
+
 func TestOpenAIResponseFlush_CompatibleAPIKeyDoesNotUseCodexBareErrorSynthesis(t *testing.T) {
 	body := "data: {\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"provider failed\"}}\n\n"
 	recorder := newOpenAIResponseFlushRecorder()
