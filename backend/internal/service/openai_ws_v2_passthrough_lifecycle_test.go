@@ -266,6 +266,52 @@ func TestPassthroughLifecycle_LaterTurnPreOutputRateLimitRequestsReconnect(t *te
 	}
 }
 
+func TestPassthroughLifecycle_LaterTurnUpstreamMessageTooBigUsesCurrentOutputState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name   string
+		output bool
+		status coderws.StatusCode
+	}{
+		{name: "before any frame", status: coderws.StatusMessageTooBig},
+		{name: "after response.created", output: true, status: coderws.StatusInternalError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			upstream := newStagedPassthroughConn()
+			svc := newPassthroughLifecycleService(passthroughLifecycleConfig(), upstream)
+			server, serverErr := startPassthroughLifecycleServer(t, ctx, svc, passthroughLifecycleAccount())
+			t.Cleanup(server.Close)
+			client := dialPassthroughLifecycleClient(t, server)
+			defer func() { _ = client.CloseNow() }()
+			requirePassthroughUpstreamWrite(t, upstream, time.Second)
+
+			upstream.Send(`{"type":"response.completed","response":{"id":"resp_first","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)
+			_, err := readPassthroughLifecycleFrame(t, client, time.Second)
+			require.NoError(t, err)
+			require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","stream":false}`)))
+			requirePassthroughUpstreamWrite(t, upstream, time.Second)
+			if tc.output {
+				upstream.Send(`{"type":"response.created","response":{"id":"resp_second","status":"in_progress"}}`)
+				_, err = readPassthroughLifecycleFrame(t, client, time.Second)
+				require.NoError(t, err)
+			}
+
+			upstream.Fail(coderws.CloseError{Code: coderws.StatusMessageTooBig})
+			_, err = readPassthroughLifecycleFrame(t, client, time.Second)
+			require.Equal(t, tc.status, coderws.CloseStatus(err), "client read error: %v", err)
+			select {
+			case err := <-serverErr:
+				require.Error(t, err)
+			case <-ctx.Done():
+				t.Fatal("gateway did not stop after upstream close")
+			}
+			require.Empty(t, upstream.writes, "gateway must not replay the rejected turn")
+		})
+	}
+}
+
 func TestPassthroughLifecycle_CyberTerminalEventsMarkBeforeAfterTurn(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

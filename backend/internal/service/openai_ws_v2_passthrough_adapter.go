@@ -1462,6 +1462,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			relayErr,
 		)
 	}
+	if relayExit.Stage == openaiwsv2.RelayStageUpstreamMessageTooBig {
+		relayErr = NewOpenAIWSClientCloseError(coderws.StatusMessageTooBig, openAIWSUpstreamMessageTooBigReason, relayErr)
+	}
 	turnErr := wrapOpenAIWSIngressTurnError(
 		relayExit.Stage,
 		relayErr,
@@ -1494,6 +1497,9 @@ func openAIWSPassthroughRelayClientClose(exit openaiwsv2.RelayExit, completedTur
 	}
 	if !exit.Graceful && exit.Stage == "read_upstream" {
 		return coderws.StatusInternalError, "upstream websocket proxy failed", true
+	}
+	if exit.Stage == openaiwsv2.RelayStageUpstreamMessageTooBig {
+		return coderws.StatusMessageTooBig, openAIWSUpstreamMessageTooBigReason, true
 	}
 	return 0, "", false
 }

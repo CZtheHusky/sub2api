@@ -115,6 +115,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 			[]byte(`{"type":"response.output_item.done","item":{"id":"ig_ingress_1","type":"image_generation_call","status":"generating","result":"iVBORw0KGgoAAAANSUhEUg/+=="}}`),
 			[]byte(`{"type":"response.completed","response":{"id":"resp_ingress_turn_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
 			[]byte(`{"type":"response.completed","response":{"id":"resp_ingress_turn_2","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_ingress_turn_3","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
 		},
 	}
 	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
@@ -147,7 +148,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 	}
 
 	serverErrCh := make(chan error, 1)
-	turnTerminalCh := make(chan string, 2)
+	turnTerminalCh := make(chan string, 3)
 	hooks := &OpenAIWSIngressHooks{
 		AfterTurn: func(_ int, result *OpenAIForwardResult, turnErr error) {
 			if turnErr == nil && result != nil {
@@ -212,7 +213,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 		return message
 	}
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false}`)
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"request_country":"US"}`)
 	firstTurnImageEvent := readMessage()
 	require.Equal(t, "response.output_item.done", gjson.GetBytes(firstTurnImageEvent, "type").String())
 	require.Equal(t, "completed", gjson.GetBytes(firstTurnImageEvent, "item.status").String())
@@ -221,12 +222,23 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 	require.Equal(t, "response.completed", gjson.GetBytes(firstTurnEvent, "type").String())
 	require.Equal(t, "resp_ingress_turn_1", gjson.GetBytes(firstTurnEvent, "response.id").String())
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"resp_ingress_turn_1"}`)
+	const toolResult = `{"content":[{"type":"text","text":"synthetic result"}]}`
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,` +
+		`"previous_response_id":"resp_ingress_turn_1","request_country":null,` +
+		`"input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"synthetic output"}],` +
+		`"internal_chat_message_metadata_passthrough":{"executed_tool_calls":[` +
+		`{"name":"fixture_tool","arguments":{},"tool_result":` + toolResult + `,"tool_result_call_id":"fixture_call"}]}}]}`)
 	secondTurnEvent := readMessage()
 	require.Equal(t, "response.completed", gjson.GetBytes(secondTurnEvent, "type").String())
 	require.Equal(t, "resp_ingress_turn_2", gjson.GetBytes(secondTurnEvent, "response.id").String())
+
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"previous_response_id":"resp_ingress_turn_2"}`)
+	thirdTurnEvent := readMessage()
+	require.Equal(t, "response.completed", gjson.GetBytes(thirdTurnEvent, "type").String())
+	require.Equal(t, "resp_ingress_turn_3", gjson.GetBytes(thirdTurnEvent, "response.id").String())
 	require.Equal(t, "response.completed", <-turnTerminalCh, "首轮 turn 应保留成功终态")
 	require.Equal(t, "response.completed", <-turnTerminalCh, "第二轮 turn 应保留成功终态")
+	require.Equal(t, "response.completed", <-turnTerminalCh, "第三轮 turn 应保留成功终态")
 
 	_ = clientConn.Close(coderws.StatusNormalClosure, "done")
 
@@ -240,7 +252,18 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 	metrics := svc.SnapshotOpenAIWSPoolMetrics()
 	require.Equal(t, int64(1), metrics.AcquireTotal, "同一 ingress 会话多 turn 应只获取一次上游 lease")
 	require.Equal(t, 1, captureDialer.DialCount(), "同一 ingress 会话应保持同一上游连接")
-	require.Len(t, captureConn.writes, 2, "应向同一上游连接发送两轮 response.create")
+	require.Len(t, captureConn.writes, 3, "应向同一上游连接发送三轮 response.create")
+
+	// request_country belongs to each turn. The reused connection must preserve all three forms.
+	require.Equal(t, `"US"`, gjson.Get(requestToJSONString(captureConn.writes[0]), "request_country").Raw)
+	secondRequest := requestToJSONString(captureConn.writes[1])
+	require.Equal(t, "null", gjson.Get(secondRequest, "request_country").Raw)
+	require.False(t, gjson.Get(requestToJSONString(captureConn.writes[2]), "request_country").Exists())
+
+	// Keep the pair together on the API-key path so the result still identifies its tool call.
+	toolCall := gjson.Get(secondRequest, "input.0.internal_chat_message_metadata_passthrough.executed_tool_calls.0")
+	require.JSONEq(t, toolResult, toolCall.Get("tool_result").Raw)
+	require.Equal(t, "fixture_call", toolCall.Get("tool_result_call_id").String())
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_LeaseLossSendsRetryClose(t *testing.T) {

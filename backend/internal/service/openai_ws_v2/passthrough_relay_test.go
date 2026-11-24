@@ -350,6 +350,56 @@ func TestRelay_UpstreamNormalCloseBeforeResponseIDIsFailure(t *testing.T) {
 	require.Len(t, clientConn.Writes(), 2)
 }
 
+func TestRelay_UpstreamMessageTooBigAfterPreviousTerminalWrite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	request := []byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[]}`)
+	client := newPassthroughTestFrameConn(nil, false)
+	created := []byte(`{"type":"response.created","response":{"id":"resp_first"}}`)
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp_first"}}`)
+	upstream := newPassthroughTestFrameConn([]passthroughTestFrame{
+		{msgType: coderws.MessageText, payload: created},
+		{msgType: coderws.MessageText, payload: completed},
+	}, true)
+	upstreamWithClose := &eofReplacementFrameConn{FrameConn: upstream, err: coderws.CloseError{Code: coderws.StatusMessageTooBig}}
+	firstTerminalWritten := make(chan struct{})
+	secondRequestWritten := make(chan struct{})
+	sentNext := false
+	_, exit := Relay(ctx, client, upstreamWithClose, request, RelayOptions{
+		StartClientAfterFirstDownstream: true,
+		ReadClientFrame: func(ctx context.Context, _ FrameConn) (coderws.MessageType, []byte, error) {
+			if sentNext {
+				close(secondRequestWritten)
+				<-ctx.Done()
+				return 0, nil, ctx.Err()
+			}
+			select {
+			case <-firstTerminalWritten:
+				sentNext = true
+				return coderws.MessageText, request, nil
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			}
+		},
+		AfterClientWrite: func(_ coderws.MessageType, payload []byte, err error) {
+			if err != nil || string(payload) != string(completed) {
+				return
+			}
+			// The adapter makes the next turn eligible in this hook. Wait
+			// for its upstream write before letting the hook finish.
+			close(firstTerminalWritten)
+			select {
+			case <-secondRequestWritten:
+			case <-ctx.Done():
+			}
+		},
+	})
+	require.Len(t, upstream.Writes(), 2)
+	require.Len(t, client.Writes(), 2)
+	require.NotNil(t, exit)
+	require.Equal(t, RelayStageUpstreamMessageTooBig, exit.Stage)
+}
+
 func TestRelay_UpstreamNormalCloseBeforeTerminalIsFailure(t *testing.T) {
 	t.Parallel()
 
